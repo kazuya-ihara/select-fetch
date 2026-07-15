@@ -1,0 +1,6 @@
+{
+  "_note": "このファイルを supabase_config.json という名前でコピーし、service_key を貼ってください。service_role は秘密鍵。自分のMacだけに置き、共有・git・チャットに貼らないこと。",
+  "url": "https://jvnyavatcwxuljjujxua.supabase.co",
+  "service_key": "ここに Supabase の service_role キーを貼る",
+  "generated_by": "batch"
+}

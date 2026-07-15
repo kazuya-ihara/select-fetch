@@ -1,0 +1,7 @@
+{
+  "_note": "このファイルをコピーして gemini_api.json を作り、値を入れる。Macだけに置き、gitに上げない・チャットに貼らない。",
+  "api_key": "＜Google AI Studio で発行した Gemini APIキー（機密）＞",
+  "model": "gemini-2.0-flash",
+  "daily_limit": 500,
+  "_hint": "課金アカウント必須だが無料枠内で止める運用。daily_limit はこのスクリプトからの1日あたり呼び出し上限（gemini_usage.json でカウント）。モデル名は AI Studio の最新に合わせて調整可。キーが漏れたら AI Studio で無効化＆再発行。"
+}

@@ -1,0 +1,79 @@
+name: 先読み取得（毎朝・主要テーマの商品を先に入れておく）
+
+# 目的：毎朝カタログが作り直されると全切り口が空になるため、上位テーマの切り口だけ
+#      先に商品を取得しておく。担当者が朝アプリを開いた時点で商品が並んでいる状態にする。
+# 並び：catalog.yml(7:00 JST でカタログ生成) → このワークフロー(7:30 JST) → 先読み取得
+# ※対応済み切り口の取得は products.yml（30分おき）が担当。こちらは「まだ誰も対応していない
+#   主要テーマ」を先に埋めておく役割。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 22 * * *"   # 22:30 UTC = 翌 07:30 JST（カタログ生成の30分後）
+
+concurrency:
+  group: products-batch    # products.yml と同じグループ＝同時に走らせない（API枠を守る）
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      TZ: Asia/Tokyo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 鍵ファイルを Secrets から生成（機密はログに出さない）
+        env:
+          RAKUTEN_APP_ID:        ${{ secrets.RAKUTEN_APP_ID }}
+          RAKUTEN_ACCESS_KEY:    ${{ secrets.RAKUTEN_ACCESS_KEY }}
+          YAHOO_CLIENT_ID:       ${{ secrets.YAHOO_CLIENT_ID }}
+          AMZ_CREDENTIAL_ID:     ${{ secrets.AMZ_CREDENTIAL_ID }}
+          AMZ_CREDENTIAL_SECRET: ${{ secrets.AMZ_CREDENTIAL_SECRET }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          BATCH_TOKEN:           ${{ secrets.BATCH_TOKEN }}
+          AMZ_PARTNER_TAG:       ${{ secrets.AMZ_PARTNER_TAG }}
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, json, pathlib
+          pathlib.Path("product").mkdir(exist_ok=True)
+          pathlib.Path("sources").mkdir(exist_ok=True)
+          json.dump({
+            "rakuten_application_id": os.environ["RAKUTEN_APP_ID"],
+            "rakuten_access_key":     os.environ["RAKUTEN_ACCESS_KEY"],
+            "yahoo_client_id":        os.environ["YAHOO_CLIENT_ID"],
+          }, open("product/shopping_api.json","w"))
+          json.dump({
+            "credential_id":     os.environ["AMZ_CREDENTIAL_ID"],
+            "credential_secret": os.environ["AMZ_CREDENTIAL_SECRET"],
+            "partner_tag":  os.environ["AMZ_PARTNER_TAG"],
+            "marketplace":  "www.amazon.co.jp",
+            "token_url":    "https://api.amazon.com/auth/o2/token",
+            "scope":        "creatorsapi::default",
+            "api_url":      "https://creatorsapi.amazon/catalog/v1/getItems",
+          }, open("product/amazon_creators.json","w"))
+          json.dump({
+            "api_key":     os.environ["GEMINI_API_KEY"],
+            "model":       "gemini-flash-lite-latest",
+            "daily_limit": 500,
+          }, open("product/gemini_api.json","w"))
+          open("sources/service_key.txt","w").write(os.environ["BATCH_TOKEN"] + "\n")
+          print("config written")
+          PY
+
+      - name: 学習を更新（承認・👍👎 → learning.json）
+        run: python3 product/learn.py
+
+      - name: 先読みキューを作る（Supabaseの今日のカタログ → 上位テーマの切り口）
+        run: python3 product/build_fetch_queue.py
+
+      - name: 先読み取得（→ v2_product。今日のcatalog_dateで保存）
+        run: python3 product/product_fetch.py --queue product/fetch_queue.json --limit 30 --rerank
+
+      - name: 後片付け（鍵ファイルを消す）
+        if: always()
+        run: rm -f product/shopping_api.json product/amazon_creators.json product/gemini_api.json sources/service_key.txt

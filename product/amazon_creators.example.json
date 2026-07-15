@@ -1,0 +1,12 @@
+{
+  "_note": "このファイルをコピーして amazon_creators.json を作り、値を入れる。amazon_creators.json は Macだけに置き、gitに上げない・チャットに貼らない。",
+  "credential_id": "＜Associates Central → Tools → Creators API で発行した Credential ID＞",
+  "credential_secret": "＜同 Credential Secret（機密）＞",
+  "partner_tag": "amec0e-22",
+  "marketplace": "www.amazon.co.jp",
+  "token_url": "https://api.amazon.com/auth/o2/token",
+  "scope": "creatorsapi::default",
+  "api_url": "https://creatorsapi.amazon/catalog/v1/getItems",
+  "test_asins": ["B0CHWRXH8B", "B08N5WRWNW"],
+  "_hint": "token_url / scope / api_url は Creators API公式ドキュメントの最新値に合わせて必要なら修正。test_asins は amazon.co.jp に実在するASINを2〜3個。"
+}

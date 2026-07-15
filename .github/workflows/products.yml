@@ -1,0 +1,74 @@
+name: 商品バッチ（対応済み切り口を取得）
+
+# 手動実行（Actions画面の「Run workflow」ボタン）。誰でも押せる＝個人Mac不要。
+# 最新カタログは Supabase から読むので、ここではカタログ生成しない（生成は catalog.yml）。
+# 定期実行したい場合は schedule のコメントを外す（cronはUTC）。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"   # 30分おきに自動実行（対応済み切り口を取得。手動ボタンも残す）
+
+concurrency:
+  group: products-batch
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Tokyo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 鍵ファイルを Secrets から生成（機密はログに出さない）
+        env:
+          RAKUTEN_APP_ID:        ${{ secrets.RAKUTEN_APP_ID }}
+          RAKUTEN_ACCESS_KEY:    ${{ secrets.RAKUTEN_ACCESS_KEY }}
+          YAHOO_CLIENT_ID:       ${{ secrets.YAHOO_CLIENT_ID }}
+          AMZ_CREDENTIAL_ID:     ${{ secrets.AMZ_CREDENTIAL_ID }}
+          AMZ_CREDENTIAL_SECRET: ${{ secrets.AMZ_CREDENTIAL_SECRET }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          BATCH_TOKEN:           ${{ secrets.BATCH_TOKEN }}
+          AMZ_PARTNER_TAG:       ${{ secrets.AMZ_PARTNER_TAG }}
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, json, pathlib
+          pathlib.Path("product").mkdir(exist_ok=True)
+          pathlib.Path("sources").mkdir(exist_ok=True)
+          json.dump({
+            "rakuten_application_id": os.environ["RAKUTEN_APP_ID"],
+            "rakuten_access_key":     os.environ["RAKUTEN_ACCESS_KEY"],
+            "yahoo_client_id":        os.environ["YAHOO_CLIENT_ID"],
+          }, open("product/shopping_api.json","w"))
+          json.dump({
+            "credential_id":     os.environ["AMZ_CREDENTIAL_ID"],
+            "credential_secret": os.environ["AMZ_CREDENTIAL_SECRET"],
+            "partner_tag":  os.environ["AMZ_PARTNER_TAG"],
+            "marketplace":  "www.amazon.co.jp",
+            "token_url":    "https://api.amazon.com/auth/o2/token",
+            "scope":        "creatorsapi::default",
+            "api_url":      "https://creatorsapi.amazon/catalog/v1/getItems",
+          }, open("product/amazon_creators.json","w"))
+          json.dump({
+            "api_key":     os.environ["GEMINI_API_KEY"],
+            "model":       "gemini-flash-lite-latest",
+            "daily_limit": 500,
+          }, open("product/gemini_api.json","w"))
+          open("sources/service_key.txt","w").write(os.environ["BATCH_TOKEN"] + "\n")
+          print("config written")
+          PY
+
+      - name: 学習を更新（承認・👍👎 → learning.json）
+        run: python3 product/learn.py
+
+      - name: 対応済み切り口の商品を取得（→ v2_product）
+        run: python3 product/fetch_claimed.py --rerank --limit 40
+
+      - name: 後片付け（鍵ファイルを消す）
+        if: always()
+        run: rm -f product/shopping_api.json product/amazon_creators.json product/gemini_api.json sources/service_key.txt

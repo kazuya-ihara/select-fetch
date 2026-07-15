@@ -1,0 +1,7 @@
+{
+  "_note": "このファイルをコピーして shopping_api.json を作り、値を入れる。Macだけに置き、gitに上げない・チャットに貼らない。",
+  "rakuten_application_id": "＜楽天の applicationId（UUID形式・例 xxxxxxxx-xxxx-...）＞",
+  "rakuten_access_key": "＜楽天の accessKey（pk_ で始まる機密。再発行した最新の値）＞",
+  "yahoo_client_id": "＜Yahoo!デベロッパーの Client ID（アプリケーションID）＞",
+  "_hint": "楽天は 2026新形式で applicationId と accessKey の両方が必要。エンドポイントは openapi.rakuten.co.jp/ichibams/api。accessKeyは機密なのでチャットに貼らない・漏れたら再発行する。"
+}
