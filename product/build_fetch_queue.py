@@ -23,9 +23,9 @@ ROOT = os.path.dirname(HERE)
 CATALOG = os.path.join(ROOT, "data", "catalog", "latest.json")
 OUT = os.path.join(HERE, "fetch_queue.json")
 
-TOP_THEMES = 8
-MAX_ANGLES = 30
-PER_THEME = 4
+TOP_THEMES = int(os.environ.get("TOP_THEMES", "80"))    # 実質すべてのテーマ
+MAX_ANGLES = int(os.environ.get("MAX_ANGLES", "300"))   # キュー全体の上限
+PER_THEME  = int(os.environ.get("PER_THEME", "4"))
 
 
 def theme_sort_key(t):

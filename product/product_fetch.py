@@ -40,7 +40,7 @@ SB_URL = os.environ.get("SUPABASE_URL") or ""
 SB_PUBLISHABLE = "sb_publishable_hbtP3WrNCJp0BUuBrDs4Ww_6x79K4uc"
 
 # ガード既定値（慎重運用。必要なら調整）
-DAILY_ANGLE_LIMIT = 40      # 1日に取得する切り口の上限（各切り口=多数のAPI呼び出し）
+DAILY_ANGLE_LIMIT = int(os.environ.get("DAILY_ANGLE_LIMIT", "40"))  # env で上書き可（公開先読みは300）
 SLEEP_BETWEEN_ANGLES = 2.0  # 切り口間のウェイト（秒）
 
 
