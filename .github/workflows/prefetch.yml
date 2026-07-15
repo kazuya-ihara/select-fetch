@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 50
     env:
       TZ: Asia/Tokyo
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
