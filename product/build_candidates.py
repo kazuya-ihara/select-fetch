@@ -556,6 +556,57 @@ def dedup_key(row):
 
 VERDICT_ORDER = {"採用": 0, "要確認": 1, "保留": 2}
 
+# ---- 同ブランドの「サイズ/色/個数違い」を畳む（親ASINが取れない分の補完）----
+_VAR_SIZE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:m|cm|mm|㎝|l|kg|g|畳|人用|段階|枚|個|点|本|セット|冠|位|層|通り|%|[x×✕])"
+    r"(?:\s*(?:m|cm|mm|人用))?|\d+\s*[-〜~]\s*\d+")
+_VAR_COLOR = re.compile(
+    r"ブラック|ホワイト|グレー|ネイビー|ベージュ|カーキ|グリーン|ブルー|レッド|ピンク|"
+    r"ブラウン|アイボリー|サンドベージュ|深緑|シルバー|黒|白")
+# 差別化に使わない汎用の売り文句・カテゴリ語（残すと別モデル判定が緩くなる）
+_VAR_STOP = set((
+    "枕 まくら タープ テント タープテント ワンタッチテント ワンタッチ 大型 大型テント 日除け 日よけ "
+    "遮光 遮熱 uvカット uvカット加工 紫外線カット アウトドア キャンプ イベント 運動会 祭り 祭り用 "
+    "レジャー 収納 収納ケース付 持ち運び 便利 簡単 組立 組み立て 在庫一掃 スチール製 高耐水加工 "
+    "コーティング シルバーコーティング テントタープ 専用 用 共通 横幕 サイドシート ドアシート "
+    "キャスターバッグ付き 丈夫 風に強い 洗える 快適 調節 高さ調整 硬さ調整").split())
+
+
+def _variant_core(brand, title):
+    """タイトルからサイズ/色/汎用語を除いた「特徴語」の集合を返す。"""
+    b = _norm_brand(brand)
+    t = norm(title)
+    t = _VAR_SIZE.sub(" ", t)
+    t = _VAR_COLOR.sub(" ", t)
+    t = re.sub(r"[【】\[\]()（）★☆/・|,、。!！?？·＼／]", " ", t)
+    toks = [w for w in re.split(r"\s+", t) if len(w) >= 2]
+    return b, set(w for w in toks if w not in _VAR_STOP and b not in w and w not in b)
+
+
+def _same_variant(a, b):
+    """同ブランドで、特徴語がほぼ無い(汎用品の色/サイズ違い) か 特徴語が高被覆なら同一品とみなす。"""
+    if a[0] != b[0] or not a[0]:
+        return False
+    ca, cb = a[1], b[1]
+    if max(len(ca), len(cb)) <= 1:
+        return True
+    inter = len(ca & cb)
+    short = min(len(ca), len(cb)) or 1
+    union = len(ca | cb) or 1
+    return (inter / union) >= 0.5 or (inter / short) >= 0.6
+
+
+def collapse_variants(rows):
+    """ASIN重複排除後の並び済みリストから、同ブランドの色/サイズ/個数違いを畳む（上位を残す）。"""
+    kept, keys = [], []
+    for r in rows:
+        amz = r.get("amazon", {})
+        k = _variant_core(amz.get("brand"), amz.get("title"))
+        if any(_same_variant(k, kk) for kk in keys):
+            continue
+        kept.append(r); keys.append(k)
+    return kept
+
 
 # ============================================================
 # 6.（任意）AIリランク：切り口適合度で並べ替え（Gemini）
@@ -868,6 +919,11 @@ def main():
                              -learn_score(r["amazon"].get("brand")),
                              -r["consensus"],
                              -(r["candidate"].get("review_count") or 0)))
+    # 同ブランドの色/サイズ/個数違いを畳む（親ASINが返らない分の補完。上位を残す）
+    before_var = len(uniq)
+    uniq = collapse_variants(uniq)
+    if before_var != len(uniq):
+        print("    同ブランドの色/サイズ/個数違いを %d件 畳み込み" % (before_var - len(uniq)))
     multi = sum(1 for r in uniq if r["consensus"] >= 2)
     print("\n[5] 重複排除＋多源コンセンサス: %d件 → %d件（うち複数ソース一致=%d件）"
           % (len(resolved), len(uniq), multi))
