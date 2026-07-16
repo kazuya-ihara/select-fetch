@@ -26,9 +26,9 @@ jobs:
     env:
       TZ: Asia/Tokyo
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      DAILY_ANGLE_LIMIT: "300"
+      DAILY_ANGLE_LIMIT: "400"
       TOP_THEMES: "80"
-      MAX_ANGLES: "300"
+      MAX_ANGLES: "400"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -82,7 +82,7 @@ jobs:
 
       - name: 先読み取得（→ v2_product。今日のcatalog_dateで保存）
         run: |
-          python3 product/product_fetch.py --queue product/fetch_queue.json --limit 300 ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '--force' || '' }}
+          python3 product/product_fetch.py --queue product/fetch_queue.json --limit 400 ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '--force' || '' }}
 
       - name: 後片付け（鍵ファイルを消す）
         if: always()
