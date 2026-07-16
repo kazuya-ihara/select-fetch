@@ -29,6 +29,7 @@ jobs:
       DAILY_ANGLE_LIMIT: "400"
       TOP_THEMES: "80"
       MAX_ANGLES: "400"
+      PER_THEME: "6"     # backed + gray救済 を各テーマ全部拾う（4だと溢れる）
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
