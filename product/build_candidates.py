@@ -34,7 +34,7 @@ SHOP = os.path.join(HERE, "shopping_api.json")
 AMZ = os.path.join(HERE, "amazon_creators.json")
 
 # 目標件数（プールの下限。足りなければ 要確認→保留 を繰り上げて埋める）
-TARGET_MIN = 8
+TARGET_MIN = 9
 # 検索で集める生候補の下限。除外・Amazon照合で落ちる分を見込んで目標の3倍を確保する。
 POOL_MIN = TARGET_MIN * 3
 # Amazon searchItems で照合する上限件数（レビュー件数順の上位のみ）。速度＆無料枠の節約。
