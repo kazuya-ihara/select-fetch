@@ -26,6 +26,7 @@ build_candidates.py（①除外/照合ゲート＋②多源コンセンサス＋
 """
 import os, re, sys, json, time, argparse, datetime, subprocess
 import urllib.request, urllib.error
+import socket as _socket; _socket.setdefaulttimeout(90)  # 保険：明示timeout無しの通信でも固まらない
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)

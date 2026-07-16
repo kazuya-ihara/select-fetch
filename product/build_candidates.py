@@ -27,6 +27,7 @@
 """
 import os, sys, re, json, time, base64, unicodedata
 import urllib.parse, urllib.request, urllib.error
+import socket as _socket; _socket.setdefaulttimeout(90)  # 保険：明示timeout無しの通信でも固まらない
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHOP = os.path.join(HERE, "shopping_api.json")
