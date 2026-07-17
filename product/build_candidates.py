@@ -250,7 +250,17 @@ def plan_queries(kw, extra_queries=None):
         # tier2（救済）: 修飾語だけ。「花火大会」「夏祭り」など“場面”テーマは
         #   商品名が修飾語のほう（浴衣/甚平/工作キット）なので、これが無いと当たらない。
         t2 = list(mods[:3])
-        plan += t0 + t1 + t2
+        # 順序：テーマ単独(t1=本物の商品が並ぶ)を先頭に、テーマ+修飾(t0)と交互に投げる。
+        #   ※以前は t0 を先に全部投げていたため、修飾語で汚染された候補（例「おむつ 漏れない」で
+        #     ヒットするおむつゴミ箱/犬用）だけで候補下限に達し、肝心の「テーマ単独」検索
+        #     （本物の商品）が実行される前に打ち切られていた。これが用途違い混入の主因。
+        inter = []
+        for i in range(max(len(t1), len(t0))):
+            if i < len(t1):
+                inter.append(t1[i])
+            if i < len(t0):
+                inter.append(t0[i])
+        plan += inter + t2
     # 重複除去（順序維持）＋ クエリ数の上限（無料枠保護）
     seen, out = set(), []
     for q in plan:
@@ -278,7 +288,12 @@ def gather_candidates(app_id, access_key, cid, kw, min_need=None, extra_queries=
     if not queries:
         return [], []
     seen, cands, tried = set(), [], []
-    for q in queries:
+    # 早期停止は「最低 MIN_QUERIES 本を投げた後」に限る。
+    #   ※テーマ単独クエリだけで min_need に達して打ち切ると、場面テーマ(花火大会等)の
+    #     本命である『テーマ+修飾語（花火大会 場所取り→レジャーシート）』が走らず、
+    #     汎用品ばかりになる事故を防ぐ。最初の数本で t1(テーマ単独)と t0(テーマ+修飾)を必ず通す。
+    MIN_QUERIES = 4
+    for i, q in enumerate(queries):
         rows = rakuten(app_id, access_key, q) + yahoo(cid, q)
         added = 0
         for r in rows:
@@ -287,7 +302,7 @@ def gather_candidates(app_id, access_key, cid, kw, min_need=None, extra_queries=
             if nm and k not in seen:
                 seen.add(k); cands.append(r); added += 1
         tried.append("%s(+%d)" % (q, added))
-        if len(cands) >= min_need:
+        if len(cands) >= min_need and i >= MIN_QUERIES - 1:
             break
     return cands, tried
 
@@ -622,6 +637,37 @@ def learn_score(brand):
         return 0.0
 
 
+_FEMALE_RE = re.compile(r"レディース|婦人|女性|ウィメンズ|ウーマン|女の子")
+_MALE_RE   = re.compile(r"メンズ|紳士|男性|男の子")
+
+
+def _gender_of(title):
+    """商品タイトルから性別を推定。'f'/'m'/None(両用・不明)。両方の語があれば両用(None)。"""
+    t = norm(title)
+    f = bool(_FEMALE_RE.search(t)); m = bool(_MALE_RE.search(t))
+    if f and not m:
+        return "f"
+    if m and not f:
+        return "m"
+    return None   # 両用・不明は性別に依らず残す
+
+
+def gender_consistency(items, target=TARGET_MIN):
+    """性別のある商品が混在する場合、多数派の性別＋両用に揃える（少数派を後方へ）。
+    ・明確に性別付きの商品が2種類とも一定数ある時だけ作動（家電/食品等は無影響）。
+    ・揃えると target 未満になる場合は少数派を戻して空にしない。"""
+    fem = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) == "f"]
+    mal = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) == "m"]
+    if len(fem) < 2 or len(mal) < 2:
+        return items   # 片方しか無い/性別商品でない → そのまま
+    keep_g = "f" if len(fem) >= len(mal) else "m"   # 多数派に寄せる
+    primary = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) in (keep_g, None)]
+    minority = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) not in (keep_g, None)]
+    if len(primary) < target and minority:
+        primary += minority[:target - len(primary)]
+    return primary
+
+
 def diversify_brands(items, max_per=MAX_PER_BRAND, target=TARGET_MIN):
     """並び済みリストから、同ブランドが max_per を超えないように選ぶ（多様性確保）。
     ・上位（＝良い順）から、各ブランド max_per 件までを採用。
@@ -677,6 +723,70 @@ def gemini_usage_bump(today, used):
         print("    Gemini使用量の記録失敗:", e)
 
 
+def gemini_expand_queries(conf, angle_kw):
+    """切り口(検索意図)を、楽天/Yahooで“本命の商品”に当たる具体的な検索クエリ2〜4個へ変換する。
+    肝：切り口の概念語(盗難/場所取り/食いつき/高さ 等)は、そのままでは商品名にないため、
+        それを満たす具体的な商品名・カテゴリに翻訳する（盗難→自転車 鍵/U字ロック 等）。
+    これを gather_candidates の extra_queries（最優先クエリ）に渡すと、本命が候補プールに入る。
+    失敗時は [] を返し、通常の plan_queries にフォールバックする。"""
+    ok, today, used = gemini_usage_ok(conf["daily_limit"])
+    if not ok:
+        return []
+    prompt = (
+        "あなたはEC検索のプロです。以下の『切り口(検索意図)』に最も合う商品を"
+        "楽天/Yahooショッピングで見つけるための検索クエリを2〜4個作ってください。\n"
+        "重要ルール:\n"
+        "1) 切り口の“概念・悩み・目的”の語（例: 盗難/場所取り/食いつき/高さ/外れる/涼しい/日持ち）は、"
+        "それを解決する具体的な商品名・カテゴリに翻訳する。\n"
+        "   例) 自転車 盗難 → 「自転車 鍵 U字ロック」「自転車 GPS 盗難防止」\n"
+        "       花火大会 場所取り → 「レジャーシート 大判」\n"
+        "       枕 高さ → 「高さ調整枕」\n"
+        "       シニア犬 食いつき ドッグフード → 「シニア犬 ドッグフード 嗜好性」\n"
+        "2) 切り口が指定する対象（シニア/新生児/レディース/メンズ 等）は必ずクエリに残す。\n"
+        "3) 各クエリは実際に商品タイトルに現れる2〜4語の日本語。抽象語だけのクエリは作らない。\n"
+        "4) 商品カテゴリが曖昧な切り口（『こだわる〇〇グッズ』『カップル向けの〇〇』等）でも、"
+        "その場面・目的で最も定番の具体商品を1〜2種類に絞って出す"
+        "（例: 花火大会 カップル → 「浴衣 レディース」「手持ち花火 セット」）。\n"
+        "5) 衣類・履物・下着など“性別のある商品”で切り口に性別指定が無い場合は、"
+        "レディース向けで統一する（文脈でメンズが自然ならメンズで統一。性別を混在させない）。\n"
+        "出力は必ずJSON配列（文字列の配列）のみ: [\"クエリ1\",\"クエリ2\",...]\n\n"
+        "切り口: " + angle_kw)
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
+           % (conf["model"], conf["api_key"]))
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
+    }).encode()
+    data = None
+    for attempt in range(1, 3):
+        try:
+            data = get_json(url, data=body,
+                            headers={"Content-Type": "application/json"}, timeout=60)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (503, 500, 429) and attempt < 2:
+                time.sleep(5); continue
+            return []
+        except Exception:
+            if attempt < 2:
+                time.sleep(5); continue
+            return []
+    if data is None:
+        return []
+    gemini_usage_bump(today, used)
+    try:
+        txt = dig(data, "candidates", 0, "content", "parts", 0, "text") or "[]"
+        arr = json.loads(txt)
+        out = []
+        for q in arr:
+            q = str(q).strip()
+            if q and q not in out:
+                out.append(q)
+        return out[:4]
+    except Exception:
+        return []
+
+
 def gemini_rerank(conf, angle_kw, pool, few_shot=None):
     """poolを切り口適合度でリランク。各itemに ai_score(0-100)/ai_reason を付与。
        few_shot=過去の👍商品（将来用。今は空でOK）。失敗時はpoolをそのまま返す。"""
@@ -698,8 +808,12 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
 
     prompt = (
         "あなたはECの商品選定アシスタントです。以下の『切り口(検索意図)』に、各商品がどれだけ合致するかを"
-        "0〜100で採点してください。ブランドの信頼性・切り口との用途一致・不自然な煽り/粗悪さも加味します。"
-        "価格の高安だけで過度に上下させないこと。\n"
+        "0〜100で採点してください。\n"
+        "【最重要】切り口が求める“商品カテゴリ・用途・形状”に合わないものは大きく減点（20点以下）してください。\n"
+        "  - 別カテゴリの無関係な商品（例：イヤホンの切り口にキーケース/ゴミ箱/ペット用品）＝ほぼ0点。\n"
+        "  - カテゴリは同じでも切り口の用途に合わない形状/仕様（例：『運動/通勤で外れない』なら、"
+        "コードが邪魔で外れやすい“有線”や、固定力の弱い開放型は低評価。『高音質でじっくり』なら逆に許容）。\n"
+        "ブランドの信頼性・不自然な煽り/粗悪さも加味し、価格の高安だけで過度に上下させないこと。\n"
         "出力は必ずJSON配列のみ: [{\"i\":番号,\"score\":整数,\"reason\":\"20字程度の理由\"}]\n\n"
         "切り口: " + angle_kw + fewshot_txt + "\n\n商品一覧:\n" + "\n".join(lines))
 
@@ -767,8 +881,17 @@ def main():
     print("検索キーワード:", kw)
     print("=" * 62)
 
-    # --- 1. 候補取得（狭いクエリで足りなければ語を減らして自動で広げる）---
-    cands, tried = gather_candidates(app_id, access_key, cid, kw)
+    # AIクエリ変換（--rerank時のみ・Gemini設定があれば）。切り口の概念語を具体的な商品語へ
+    #   翻訳し、gather の最優先クエリにする（例：自転車 盗難→自転車 鍵/U字ロック）。
+    gconf = load_gemini_conf() if want_rerank else None
+    ai_queries = []
+    if gconf:
+        ai_queries = gemini_expand_queries(gconf, kw)
+        if ai_queries:
+            print("[0] AIクエリ変換 → " + " / ".join(ai_queries))
+
+    # --- 1. 候補取得（AI変換クエリを最優先に、足りなければテーマ/修飾語で補完）---
+    cands, tried = gather_candidates(app_id, access_key, cid, kw, extra_queries=(ai_queries or None))
     print("\n[1] 候補取得: 計 %d件（試したクエリ: %s）"
           % (len(cands), " / ".join(tried)))
     if not cands:
@@ -873,7 +996,7 @@ def main():
     #       を除外してから選ぶ。これにより先読みでも用途違いが並ばない。
     reranked = False
     if want_rerank:
-        gconf = load_gemini_conf()
+        # gconf は main 冒頭でロード済み（AIクエリ変換と共用）。二重ロードしない。
         if gconf:
             print("\n[6] AIリランク（Gemini %s）で切り口適合度を採点し用途不一致を除外…" % gconf["model"])
             _few = (LEARN.get("few_shot") if LEARN else None) or None
@@ -896,7 +1019,13 @@ def main():
         else:
             print("\n[6] AIリランク: gemini_api.json が無い/未設定のためスキップ")
 
-    # --- 7. ブランド多様性：同ブランドばかりにならないよう間引く（上位優先・空にしない） ---
+    # --- 7a. 性別の統一：レディース/メンズが混在する切り口は多数派＋両用に揃える ---
+    _before_g = len(uniq)
+    uniq = gender_consistency(uniq)
+    if _before_g != len(uniq):
+        print("    性別統一：混在する少数派 %d件を後方へ" % (_before_g - len(uniq)))
+
+    # --- 7b. ブランド多様性：同ブランドばかりにならないよう間引く（上位優先・空にしない） ---
     _before_div = len(uniq)
     uniq = diversify_brands(uniq)
     if _before_div != len(uniq):
