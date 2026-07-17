@@ -665,23 +665,81 @@ def _batch_token():
     return None
 
 
-def _budget_rpc(add):
-    """Supabaseの共有カウンタを add 加算し、新しい used を返す（p_add=0で読み取りのみ）。失敗時None。"""
+def _sb_rpc(name, payload, timeout=15):
+    """Supabaseの SECURITY DEFINER RPC を叩く共通関数。batchトークンを自動付与。失敗時None。"""
     url, tok = _sb_url(), _batch_token()
     if not url or not tok:
         return None
     try:
-        body = json.dumps({"p_secret": tok, "p_pac_date": _pac_today(),
-                           "p_add": int(add)}).encode("utf-8")
-        req = urllib.request.Request(url + "/rest/v1/rpc/v2_ai_budget_take",
-            data=body, method="POST",
+        p = dict(payload); p["p_secret"] = tok
+        body = json.dumps(p, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url + "/rest/v1/rpc/" + name, data=body, method="POST",
             headers={"apikey": SB_PUBLISHABLE, "Authorization": "Bearer " + SB_PUBLISHABLE,
                      "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             t = r.read().decode("utf-8")
-            return int(t) if t.strip() else None
+            return json.loads(t) if t.strip() else None
     except Exception:
         return None
+
+
+def _budget_rpc(add):
+    """共有カウンタを add 加算し、新しい used を返す（p_add=0で読み取りのみ）。失敗時None。"""
+    r = _sb_rpc("v2_ai_budget_take", {"p_pac_date": _pac_today(), "p_add": int(add)})
+    try:
+        return int(r) if r is not None else None
+    except Exception:
+        return None
+
+
+# ---- AI結果の資産化キャッシュ（切り口→クエリ変換／切り口×商品→適合スコア） ----
+# 一度計算したら二度と計算しない。angle_key に「プロンプト版＋学習内容」を織り込むので、
+# それらが変わった時だけ自動で無効化＝採り直しになる（＝学習は生きたまま効率化）。
+def _norm_key(s):
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+
+def _fewshot_sig(few_shot):
+    """学習お手本のシグネチャ。学習が更新されればスコアキャッシュが自動で無効化される。"""
+    if not few_shot:
+        return "0"
+    import hashlib
+    return hashlib.md5("\n".join(sorted(str(x) for x in few_shot)).encode("utf-8")).hexdigest()[:8]
+
+
+def _qkey(angle_kw):
+    return "q1|" + _norm_key(angle_kw)                         # q1 = クエリ変換プロンプト版
+
+
+def _skey(angle_kw, few_shot):
+    return "s1|%s|%s" % (_fewshot_sig(few_shot), _norm_key(angle_kw))   # s1 = 採点プロンプト版
+
+
+def _cache_query_get(angle_kw):
+    r = _sb_rpc("v2_ai_query_get", {"p_angle_key": _qkey(angle_kw)})
+    return [str(x) for x in r] if isinstance(r, list) else None
+
+
+def _cache_query_put(angle_kw, queries):
+    _sb_rpc("v2_ai_query_put", {"p_angle_key": _qkey(angle_kw),
+                                "p_queries": list(queries or []), "p_model": "gemini"})
+
+
+def _cache_score_get(angle_kw, few_shot, asins):
+    r = _sb_rpc("v2_ai_score_get", {"p_angle_key": _skey(angle_kw, few_shot),
+                                    "p_asins": list(asins or [])})
+    out = {}
+    if isinstance(r, list):
+        for row in r:
+            if isinstance(row, dict) and row.get("asin"):
+                out[row["asin"]] = (row.get("score"), row.get("reason") or "")
+    return out
+
+
+def _cache_score_put(angle_kw, few_shot, items):
+    if items:
+        _sb_rpc("v2_ai_score_put", {"p_angle_key": _skey(angle_kw, few_shot),
+                                    "p_items": items, "p_model": "gemini"})
 
 
 def _local_used():
@@ -871,6 +929,9 @@ def gemini_expand_queries(conf, angle_kw):
         それを満たす具体的な商品名・カテゴリに翻訳する（盗難→自転車 鍵/U字ロック 等）。
     これを gather_candidates の extra_queries（最優先クエリ）に渡すと、本命が候補プールに入る。
     失敗時は [] を返し、通常の plan_queries にフォールバックする。"""
+    cached = _cache_query_get(angle_kw)
+    if cached is not None:
+        return cached          # 資産キャッシュから即返す（Geminiを呼ばない）
     # expandは“あると良い”寄り。共有予算が細ったら省略し、rerank用の枠を温存する。
     ok, today, used = gemini_usage_ok(conf["daily_limit"], kind="expand")
     if not ok:
@@ -936,21 +997,51 @@ def gemini_expand_queries(conf, angle_kw):
             q = str(q).strip()
             if q and q not in out:
                 out.append(q)
-        return out[:4]
+        out = out[:4]
+        _cache_query_put(angle_kw, out)   # 資産に保存（次回以降は0コスト）
+        return out
     except Exception:
         return []
 
 
+def _rerank_sort(pool):
+    """並べ替え：採用優先 → AIスコア高い → 学習ブランド重み → コンセンサス多い → レビュー多い。"""
+    pool.sort(key=lambda r: (VERDICT_ORDER[r["verdict"]],
+                             -(r.get("ai_score") if r.get("ai_score") is not None else -1),
+                             -learn_score(r["amazon"].get("brand")),
+                             -r["consensus"],
+                             -(r["candidate"].get("review_count") or 0)))
+
+
 def gemini_rerank(conf, angle_kw, pool, few_shot=None):
     """poolを切り口適合度でリランク。各itemに ai_score(0-100)/ai_reason を付与。
-       few_shot=過去の👍商品（将来用。今は空でOK）。失敗時はpoolをそのまま返す。"""
+       資産キャッシュ（切り口×ASIN→スコア）を優先し、未キャッシュ分だけGeminiで採点する。
+       few_shot=過去の👍商品。失敗時はpoolをそのまま返す。"""
+    # 1) 資産キャッシュを適用：既知の(切り口×ASIN)はDBから即スコア（Geminiを使わない）
+    asins = [r["amazon"].get("asin") for r in pool if r["amazon"].get("asin")]
+    cached = _cache_score_get(angle_kw, few_shot, asins) if asins else {}
+    todo = []
+    for r in pool:
+        a = r["amazon"].get("asin")
+        if a and a in cached:
+            r["ai_score"], r["ai_reason"] = cached[a]
+        else:
+            r["ai_score"], r["ai_reason"] = None, ""
+            todo.append(r)
+    # 2) 全件キャッシュ命中ならGeminiを呼ばず確定
+    if not todo:
+        _rerank_sort(pool)
+        print("    AIスコア: 全%d件キャッシュ命中（Gemini呼び出し0）" % len(pool))
+        return pool, True
+
+    # 3) 未キャッシュ分だけ採点（プロンプトも縮小＝トークン節約）
     ok, today, used = gemini_usage_ok(conf["daily_limit"])
     if not ok:
-        print("    Gemini: 日次上限(%d)に到達。リランクをスキップ" % conf["daily_limit"])
+        print("    Gemini: 日次上限(%d)到達。未採点%d件は採点せず→既存保護" % (conf["daily_limit"], len(todo)))
         return pool, False
 
     lines = []
-    for i, r in enumerate(pool, 1):
+    for i, r in enumerate(todo, 1):
         amz = r["amazon"]
         lines.append("%d) %s | ブランド:%s | 価格:%s | %d源一致 | レビュー%s件"
                      % (i, (amz.get("title") or "")[:70], amz.get("brand") or "-",
@@ -1016,16 +1107,17 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
         print("    Geminiの応答解析失敗（リランクせず）:", e)
         return pool, False
 
-    for i, r in enumerate(pool, 1):
+    new_items = []
+    for i, r in enumerate(todo, 1):
         s = by_i.get(i, {})
         r["ai_score"] = s.get("score")
         r["ai_reason"] = s.get("reason", "")
-    # 並べ替え：採用優先 → AIスコア高い → コンセンサス多い → レビュー多い
-    pool.sort(key=lambda r: (VERDICT_ORDER[r["verdict"]],
-                             -(r.get("ai_score") if r.get("ai_score") is not None else -1),
-                             -learn_score(r["amazon"].get("brand")),
-                             -r["consensus"],
-                             -(r["candidate"].get("review_count") or 0)))
+        a = r["amazon"].get("asin")
+        if a and r["ai_score"] is not None:
+            new_items.append({"asin": a, "score": r["ai_score"], "reason": r["ai_reason"]})
+    _cache_score_put(angle_kw, few_shot, new_items)   # 新規採点を資産に追加（次回以降0コスト）
+    _rerank_sort(pool)
+    print("    AIスコア: %d件キャッシュ + %d件新規採点" % (len(pool) - len(todo), len(todo)))
     return pool, True
 
 
