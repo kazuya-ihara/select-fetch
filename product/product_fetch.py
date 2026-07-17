@@ -42,7 +42,7 @@ SB_PUBLISHABLE = "sb_publishable_hbtP3WrNCJp0BUuBrDs4Ww_6x79K4uc"
 
 # ガード既定値（慎重運用。必要なら調整）
 DAILY_ANGLE_LIMIT = int(os.environ.get("DAILY_ANGLE_LIMIT", "40"))  # env で上書き可（公開先読みは300）
-SLEEP_BETWEEN_ANGLES = 2.0  # 切り口間のウェイト（秒）
+SLEEP_BETWEEN_ANGLES = 1.0  # 切り口間のウェイト（秒）
 
 
 def today_str():
@@ -202,13 +202,21 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force):
         print("  × プールが空。保存せず。"); return "empty"
     rows = to_rows(pool)
     usage_bump()
+    # 安全ガード：AIリランクを頼んだのに全件スコア無し＝Gemini無料枠切れ/失敗。
+    # その結果で既存の“AIフィルタ済み”データを上書きすると関連性が落ちるので、
+    # force でも上書きを止める（既存があれば保持し、空の切り口だけ新規挿入）。
+    replace = bool(force)
+    ai_ran = any(r.get("ai_score") is not None for r in rows)
+    if force and rerank and not ai_ran:
+        print("  ⚠ AIリランク不発（枠切れ?）。既存のAI済みデータ保護のため上書きしない: %s" % label)
+        replace = False
     try:
         res = rpc("v2_upsert_product", {
             "p_secret": token, "p_catalog_date": catalog_date,
             "p_theme": theme, "p_angle_title": angle or "",
-            "p_products": rows, "p_replace": bool(force)})
+            "p_products": rows, "p_replace": replace})
         if res == -1:
-            print("  ⏭ 既存ありスキップ（force未指定）: %s" % label); return "skip"
+            print("  ⏭ 既存あり・上書きせずスキップ: %s" % label); return "skip"
         print("  ✅ 保存 %s 件: %s" % (res, label)); return "saved"
     except urllib.error.HTTPError as e:
         print("  保存失敗 HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:200]))
