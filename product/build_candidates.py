@@ -629,6 +629,80 @@ def collapse_variants(rows):
 GEMINI_CONF = os.path.join(HERE, "gemini_api.json")
 GEMINI_USAGE = os.path.join(HERE, "gemini_usage.json")
 
+# --- Gemini呼び出しの“共有予算”（実行をまたいでSupabaseで管理／太平洋日でリセット） ---
+# 目的：GitHub Actionsは実行ごとにローカルのカウンタが初期化され、複数ジョブが同じ無料枠(RPD)を
+#       食い合って枯渇→429になる。そこでSupabaseの1カウンタに集約し、安全側で止める。
+# 優先度：リランク（不適合ドロップ＋ai_score付与）を最優先。クエリ変換(expand)は枠の6割で
+#         打ち切ってリランク用の枠を温存する。
+SB_PUBLISHABLE = "sb_publishable_hbtP3WrNCJp0BUuBrDs4Ww_6x79K4uc"  # 公開キー（RLS＋batchトークンで保護）
+GEMINI_EXPAND_FRACTION = 0.6   # expandはこの割合の使用量まで。残りはrerank用に温存。
+_BUDGET = {"loaded": False, "used": 0, "db": False, "exhausted": False}
+
+
+def _pac_today():
+    """太平洋時間の日付（Geminiの無料枠RPDは太平洋深夜にリセットされる）。"""
+    import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
+    except Exception:
+        return (datetime.datetime.utcnow() - datetime.timedelta(hours=8)).date().isoformat()
+
+
+def _sb_url():
+    return os.environ.get("SUPABASE_URL") or ""
+
+
+def _batch_token():
+    kp = os.path.join(os.path.dirname(HERE), "sources", "service_key.txt")
+    try:
+        for line in open(kp, encoding="utf-8"):
+            s = line.strip()
+            if s and not s.startswith("#") and s != "ここにキーを貼る":
+                return s
+    except Exception:
+        pass
+    return None
+
+
+def _budget_rpc(add):
+    """Supabaseの共有カウンタを add 加算し、新しい used を返す（p_add=0で読み取りのみ）。失敗時None。"""
+    url, tok = _sb_url(), _batch_token()
+    if not url or not tok:
+        return None
+    try:
+        body = json.dumps({"p_secret": tok, "p_pac_date": _pac_today(),
+                           "p_add": int(add)}).encode("utf-8")
+        req = urllib.request.Request(url + "/rest/v1/rpc/v2_ai_budget_take",
+            data=body, method="POST",
+            headers={"apikey": SB_PUBLISHABLE, "Authorization": "Bearer " + SB_PUBLISHABLE,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            t = r.read().decode("utf-8")
+            return int(t) if t.strip() else None
+    except Exception:
+        return None
+
+
+def _local_used():
+    """DBが使えない時のローカル・フォールバック（Mac単発実行用）。"""
+    if os.path.exists(GEMINI_USAGE):
+        try:
+            u = json.load(open(GEMINI_USAGE, encoding="utf-8"))
+            if u.get("date") == _pac_today():
+                return int(u.get("count", 0))
+        except Exception:
+            pass
+    return 0
+
+
+def _local_bump(n):
+    try:
+        json.dump({"date": _pac_today(), "count": n},
+                  open(GEMINI_USAGE, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
 # ---- ⑤学習：手動シード(learning_seed.json)＋自動学習(learning.json)を合算して並び/お手本に反映 ----
 LEARNING_FILE = os.path.join(HERE, "learning.json")        # learn.py が自動生成
 LEARNING_SEED = os.path.join(HERE, "learning_seed.json")   # 手動の叩き台（編集可）
@@ -748,27 +822,47 @@ def load_gemini_conf():
     return d
 
 
-def gemini_usage_ok(daily_limit):
-    """日次上限ガード。今日の呼び出し回数が上限未満なら True。"""
-    import datetime
-    today = datetime.date.today().isoformat()
-    used = 0
-    if os.path.exists(GEMINI_USAGE):
-        try:
-            u = json.load(open(GEMINI_USAGE, encoding="utf-8"))
-            if u.get("date") == today:
-                used = int(u.get("count", 0))
-        except Exception:
-            used = 0
-    return used < daily_limit, today, used
+def gemini_usage_ok(daily_limit, kind="rerank"):
+    """共有予算ガード。実行をまたいだ使用量(Supabase)を見て上限未満なら True。
+       kind='expand' は枠の一部までに制限し、rerank(不適合ドロップ)用の枠を温存する。
+       戻り値は従来互換の (ok, today, used)。"""
+    if not _BUDGET["loaded"]:
+        u = _budget_rpc(0)
+        if u is not None:
+            _BUDGET["used"], _BUDGET["db"] = u, True
+        else:
+            _BUDGET["used"], _BUDGET["db"] = _local_used(), False
+        _BUDGET["loaded"] = True
+    if _BUDGET.get("exhausted"):
+        return False, _pac_today(), _BUDGET["used"]
+    used = _BUDGET["used"]
+    cap = daily_limit
+    if kind == "expand":
+        cap = min(daily_limit, int(daily_limit * GEMINI_EXPAND_FRACTION))
+    return used < cap, _pac_today(), used
 
 
 def gemini_usage_bump(today, used):
-    try:
-        json.dump({"date": today, "count": used + 1},
-                  open(GEMINI_USAGE, "w", encoding="utf-8"))
-    except Exception as e:
-        print("    Gemini使用量の記録失敗:", e)
+    """共有カウンタ(Supabase)を+1。DB不可時はローカルファイルに退避。"""
+    if _BUDGET.get("db"):
+        u = _budget_rpc(1)
+        _BUDGET["used"] = u if u is not None else _BUDGET["used"] + 1
+    else:
+        _BUDGET["used"] += 1
+        _local_bump(_BUDGET["used"])
+
+
+def _budget_exhaust():
+    """Geminiが429(枠切れ)を返した時に呼ぶ。以降このプロセスではGemini呼び出しを止める。
+       共有カウンタにも上限相当を記録し、後続の実行も無駄打ちしないようにする。"""
+    _BUDGET["exhausted"] = True
+    if _BUDGET.get("db"):
+        # 残枠を埋めて cap 超えにする（他ジョブも即スキップさせる）
+        remaining = 950 - int(_BUDGET.get("used", 0))
+        if remaining > 0:
+            u = _budget_rpc(remaining)
+            if u is not None:
+                _BUDGET["used"] = u
 
 
 def gemini_expand_queries(conf, angle_kw):
@@ -777,8 +871,10 @@ def gemini_expand_queries(conf, angle_kw):
         それを満たす具体的な商品名・カテゴリに翻訳する（盗難→自転車 鍵/U字ロック 等）。
     これを gather_candidates の extra_queries（最優先クエリ）に渡すと、本命が候補プールに入る。
     失敗時は [] を返し、通常の plan_queries にフォールバックする。"""
-    ok, today, used = gemini_usage_ok(conf["daily_limit"])
+    # expandは“あると良い”寄り。共有予算が細ったら省略し、rerank用の枠を温存する。
+    ok, today, used = gemini_usage_ok(conf["daily_limit"], kind="expand")
     if not ok:
+        print("    Gemini: 予算温存のためクエリ変換を省略（used=%d）→ 通常クエリで続行" % used)
         return []
     prompt = (
         "あなたはEC検索のプロです。以下の『切り口(検索意図)』に最も合う商品を"
@@ -814,13 +910,16 @@ def gemini_expand_queries(conf, angle_kw):
         "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
     }).encode()
     data = None
+    gemini_usage_bump(today, used)   # 予約：実行前に加算（リトライ/失敗も枠を消費するため）
     for attempt in range(1, 3):
         try:
             data = get_json(url, data=body,
                             headers={"Content-Type": "application/json"}, timeout=60)
             break
         except urllib.error.HTTPError as e:
-            if e.code in (503, 500, 429) and attempt < 2:
+            if e.code == 429:
+                _budget_exhaust(); return []   # 無料枠切れ→以降スキップ
+            if e.code in (503, 500) and attempt < 2:
                 time.sleep(5); continue
             return []
         except Exception:
@@ -829,7 +928,6 @@ def gemini_expand_queries(conf, angle_kw):
             return []
     if data is None:
         return []
-    gemini_usage_bump(today, used)
     try:
         txt = dig(data, "candidates", 0, "content", "parts", 0, "text") or "[]"
         arr = json.loads(txt)
@@ -887,6 +985,7 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }).encode()
     data = None
+    gemini_usage_bump(today, used)   # 予約：実行前に加算（リトライ/失敗も枠を消費するため）
     for attempt in range(1, 4):                     # 503/タイムアウトは一時的なので最大3回
         try:
             data = get_json(url, data=body,
@@ -894,7 +993,10 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
             break
         except urllib.error.HTTPError as e:
             body_txt = e.read().decode()[:200]
-            if e.code in (503, 500, 429) and attempt < 3:
+            if e.code == 429:
+                print("    Gemini HTTP 429（無料枠切れ）→ 以降のリランクをスキップ")
+                _budget_exhaust(); return pool, False
+            if e.code in (503, 500) and attempt < 3:
                 print("    Gemini HTTP %s（%d回目）…%d秒待って再試行" % (e.code, attempt, 6 * attempt))
                 time.sleep(6 * attempt); continue
             print("    Gemini HTTP %s: %s" % (e.code, body_txt)); return pool, False
@@ -905,7 +1007,6 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
             print("    Gemini 失敗: %s: %s" % (type(e).__name__, e)); return pool, False
     if data is None:
         return pool, False
-    gemini_usage_bump(today, used)
 
     try:
         txt = dig(data, "candidates", 0, "content", "parts", 0, "text") or "[]"

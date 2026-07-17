@@ -127,8 +127,12 @@ def build_pool(kw, rerank):
     cmd = [sys.executable, BUILD, kw, "--json"]
     if rerank:
         cmd.append("--rerank")
+    # 子プロセス(build_candidates)が Gemini共有予算RPC を叩けるよう SUPABASE_URL を渡す。
+    env = dict(os.environ)
+    if SB_URL:
+        env["SUPABASE_URL"] = SB_URL
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
     except subprocess.TimeoutExpired:
         print("  build_candidates がタイムアウト"); return None
     if out.returncode != 0:
