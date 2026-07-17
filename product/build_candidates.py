@@ -38,9 +38,13 @@ TARGET_MIN = 9
 POOL_MIN = TARGET_MIN * 3
 # 1ブランドの最大表示数（同ブランドばかりにならないよう多様性を確保。足りなければ緩める）
 MAX_PER_BRAND = 2
+# Amazon照合する候補の上限。照合は1件ずつAPIを叩くので多いと激遅（先読み全体がタイムアウト）。
+#   ※gather はAI変換クエリ→テーマ→修飾 の順に集めるので、先頭ほど「切り口の本命」。
+#     レビュー数で並べ替えず gather 順のまま上位を残す＝本命(鍵/シート等)を維持しつつ高速化。
+AMAZON_RESOLVE_MAX = 14
 
 # ---- レート配慮（無料枠を超えないための最小限のウェイト）----
-SLEEP_BETWEEN_AMAZON = 1.1   # Amazon searchItems 連打の間隔（秒）
+SLEEP_BETWEEN_AMAZON = 0.6   # Amazon searchItems 連打の間隔（秒）
 
 
 # ============================================================
@@ -827,7 +831,7 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
     for attempt in range(1, 4):                     # 503/タイムアウトは一時的なので最大3回
         try:
             data = get_json(url, data=body,
-                            headers={"Content-Type": "application/json"}, timeout=120)
+                            headers={"Content-Type": "application/json"}, timeout=40)
             break
         except urllib.error.HTTPError as e:
             body_txt = e.read().decode()[:200]
@@ -912,6 +916,12 @@ def main():
         print("    ✗ [%s] %s … %s" % (cand["source"], cand["name"][:36], why))
     if flags:
         print("    （弱フラグ %d件：中華製ヒント。除外はしない）" % len(flags))
+
+    # Amazon照合は1件ずつAPIを叩くので、多いと激遅（先読みがタイムアウト）。上位のみに制限。
+    #   gather順（AI変換クエリ→テーマ→修飾）のまま先頭を残すので、切り口の本命が優先される。
+    if len(kept) > AMAZON_RESOLVE_MAX:
+        print("    照合を上位 %d件 に制限（全 %d件中／速度確保）" % (AMAZON_RESOLVE_MAX, len(kept)))
+        kept = kept[:AMAZON_RESOLVE_MAX]
 
     # --- 3. Amazon解決 ---
     c = amazon_conf()
