@@ -64,7 +64,7 @@ jobs:
           json.dump({
             "api_key":     os.environ["GEMINI_API_KEY"],
             "model":       "gemini-flash-lite-latest",
-            "daily_limit": 2000,
+            "daily_limit": 950,
           }, open("product/gemini_api.json","w"))
           open("sources/service_key.txt","w").write(os.environ["BATCH_TOKEN"] + "\n")
           print("config written")
