@@ -64,7 +64,7 @@ jobs:
           json.dump({
             "api_key":     os.environ["GEMINI_API_KEY"],
             "model":       "gemini-flash-lite-latest",
-            "daily_limit": 500,
+            "daily_limit": 2000,
           }, open("product/gemini_api.json","w"))
           open("sources/service_key.txt","w").write(os.environ["BATCH_TOKEN"] + "\n")
           print("config written")
@@ -78,7 +78,7 @@ jobs:
 
       - name: 先読み取得（→ v2_product。今日のcatalog_dateで保存）
         run: |
-          python3 product/product_fetch.py --queue product/fetch_queue.json --limit 400 ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+          python3 product/product_fetch.py --queue product/fetch_queue.json --limit 400 --rerank ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
 
       - name: 後片付け（鍵ファイルを消す）
         if: always()

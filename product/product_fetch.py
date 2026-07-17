@@ -171,6 +171,7 @@ def to_rows(pool):
             "match_reason": it.get("reason"),
             "ai_score": it.get("ai_score"),
             "ai_reason": it.get("ai_reason"),
+            "features": it.get("features") or [],       # Amazonの特徴（bullet）。商品カードの説明に表示
         })
     return rows
 

@@ -27,7 +27,6 @@
 """
 import os, sys, re, json, time, base64, unicodedata
 import urllib.parse, urllib.request, urllib.error
-import socket as _socket; _socket.setdefaulttimeout(90)  # 保険：明示timeout無しの通信でも固まらない
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHOP = os.path.join(HERE, "shopping_api.json")
@@ -37,8 +36,8 @@ AMZ = os.path.join(HERE, "amazon_creators.json")
 TARGET_MIN = 9
 # 検索で集める生候補の下限。除外・Amazon照合で落ちる分を見込んで目標の3倍を確保する。
 POOL_MIN = TARGET_MIN * 3
-# Amazon searchItems で照合する上限件数（レビュー件数順の上位のみ）。速度＆無料枠の節約。
-AMAZON_RESOLVE_MAX = 15
+# 1ブランドの最大表示数（同ブランドばかりにならないよう多様性を確保。足りなければ緩める）
+MAX_PER_BRAND = 2
 
 # ---- レート配慮（無料枠を超えないための最小限のウェイト）----
 SLEEP_BETWEEN_AMAZON = 1.1   # Amazon searchItems 連打の間隔（秒）
@@ -395,7 +394,7 @@ def amazon_search(c, token, keywords, count=3):
     payload = {
         "keywords": keywords,
         "itemCount": count,
-        "resources": ["itemInfo.title", "itemInfo.byLineInfo",
+        "resources": ["itemInfo.title", "itemInfo.byLineInfo", "itemInfo.features",
                       "offersV2.listings.price", "images.primary.large"],
         "partnerTag": c["partner_tag"],
         "partnerType": "Associates",
@@ -438,6 +437,7 @@ def parse_amazon_item(it, partner_tag):
                or dig(it, "offersV2", "listings", 0, "price", "displayAmount")
                or dig(it, "offers", "listings", 0, "price", "displayAmount")),
         image=dig(it, "images", "primary", "large", "url"),
+        features=(dig(it, "itemInfo", "features", "displayValues") or []),
         url=(it.get("detailPageURL")
              or ("https://www.amazon.co.jp/dp/%s?tag=%s" % (asin, partner_tag))),
     )
@@ -557,57 +557,6 @@ def dedup_key(row):
 
 VERDICT_ORDER = {"採用": 0, "要確認": 1, "保留": 2}
 
-# ---- 同ブランドの「サイズ/色/個数違い」を畳む（親ASINが取れない分の補完）----
-_VAR_SIZE = re.compile(
-    r"\d+(?:\.\d+)?\s*(?:m|cm|mm|㎝|l|kg|g|畳|人用|段階|枚|個|点|本|セット|冠|位|層|通り|%|[x×✕])"
-    r"(?:\s*(?:m|cm|mm|人用))?|\d+\s*[-〜~]\s*\d+")
-_VAR_COLOR = re.compile(
-    r"ブラック|ホワイト|グレー|ネイビー|ベージュ|カーキ|グリーン|ブルー|レッド|ピンク|"
-    r"ブラウン|アイボリー|サンドベージュ|深緑|シルバー|黒|白")
-# 差別化に使わない汎用の売り文句・カテゴリ語（残すと別モデル判定が緩くなる）
-_VAR_STOP = set((
-    "枕 まくら タープ テント タープテント ワンタッチテント ワンタッチ 大型 大型テント 日除け 日よけ "
-    "遮光 遮熱 uvカット uvカット加工 紫外線カット アウトドア キャンプ イベント 運動会 祭り 祭り用 "
-    "レジャー 収納 収納ケース付 持ち運び 便利 簡単 組立 組み立て 在庫一掃 スチール製 高耐水加工 "
-    "コーティング シルバーコーティング テントタープ 専用 用 共通 横幕 サイドシート ドアシート "
-    "キャスターバッグ付き 丈夫 風に強い 洗える 快適 調節 高さ調整 硬さ調整").split())
-
-
-def _variant_core(brand, title):
-    """タイトルからサイズ/色/汎用語を除いた「特徴語」の集合を返す。"""
-    b = _norm_brand(brand)
-    t = norm(title)
-    t = _VAR_SIZE.sub(" ", t)
-    t = _VAR_COLOR.sub(" ", t)
-    t = re.sub(r"[【】\[\]()（）★☆/・|,、。!！?？·＼／]", " ", t)
-    toks = [w for w in re.split(r"\s+", t) if len(w) >= 2]
-    return b, set(w for w in toks if w not in _VAR_STOP and b not in w and w not in b)
-
-
-def _same_variant(a, b):
-    """同ブランドで、特徴語がほぼ無い(汎用品の色/サイズ違い) か 特徴語が高被覆なら同一品とみなす。"""
-    if a[0] != b[0] or not a[0]:
-        return False
-    ca, cb = a[1], b[1]
-    if max(len(ca), len(cb)) <= 1:
-        return True
-    inter = len(ca & cb)
-    short = min(len(ca), len(cb)) or 1
-    union = len(ca | cb) or 1
-    return (inter / union) >= 0.5 or (inter / short) >= 0.6
-
-
-def collapse_variants(rows):
-    """ASIN重複排除後の並び済みリストから、同ブランドの色/サイズ/個数違いを畳む（上位を残す）。"""
-    kept, keys = [], []
-    for r in rows:
-        amz = r.get("amazon", {})
-        k = _variant_core(amz.get("brand"), amz.get("title"))
-        if any(_same_variant(k, kk) for kk in keys):
-            continue
-        kept.append(r); keys.append(k)
-    return kept
-
 
 # ============================================================
 # 6.（任意）AIリランク：切り口適合度で並べ替え（Gemini）
@@ -671,6 +620,24 @@ def learn_score(brand):
         return max(-6.0, min(6.0, float(w)))
     except Exception:
         return 0.0
+
+
+def diversify_brands(items, max_per=MAX_PER_BRAND, target=TARGET_MIN):
+    """並び済みリストから、同ブランドが max_per を超えないように選ぶ（多様性確保）。
+    ・上位（＝良い順）から、各ブランド max_per 件までを採用。
+    ・超過分は overflow へ退避し、目標件数に満たない時だけ良い順で補充（＝空にしない）。
+    戻り値：多様性を効かせた並び済みリスト。"""
+    picked, overflow, counts = [], [], {}
+    for r in items:
+        b = _norm_brand(r.get("amazon", {}).get("brand"))
+        if b and counts.get(b, 0) >= max_per:
+            overflow.append(r)
+            continue
+        picked.append(r)
+        counts[b] = counts.get(b, 0) + 1
+    if len(picked) < target and overflow:
+        picked += overflow[:target - len(picked)]
+    return picked
 
 
 def load_gemini_conf():
@@ -809,13 +776,10 @@ def main():
 
     # --- 2. 除外 ---
     kept, dropped, flags = [], [], {}
-    set_dropped = []   # 「セット/まとめ買い」理由だけで落ちたもの（後述の救済用）
     for cand in cands:
         res = classify_exclusion(cand)
         if res and res[0] == "drop":
             dropped.append((cand, res[1]))
-            if res[1].startswith("セット/まとめ買い"):
-                set_dropped.append(cand)
         else:
             if res and res[0] == "flag":
                 flags[id(cand)] = res[1]
@@ -826,32 +790,7 @@ def main():
     if flags:
         print("    （弱フラグ %d件：中華製ヒント。除外はしない）" % len(flags))
 
-    # --- 2b. セット除外の救済（候補が足りない時だけ）---
-    # 「セット/まとめ買い」除外は“単品優先”という好みのルールであって法令ではない。
-    # ギフト系（手土産＝詰め合わせ／浴衣＝3点セット等）は"セットが商品そのもの"なので、
-    # 厳格に適用すると候補が全滅する（実例：手土産=1件、浴衣=5件）。
-    # そこで候補が目標に満たない時だけ戻す。
-    # ※効果効能カテゴリ・怪しい効能表現（薬機法/景表法）の除外は絶対に戻さない。
-    if len(kept) < TARGET_MIN and set_dropped:
-        need = TARGET_MIN * 2 - len(kept)
-        back = set_dropped[:max(0, need)]
-        for cand in back:
-            flags[id(cand)] = "セット/詰め合わせ（候補不足のため救済）"
-            kept.append(cand)
-        if back:
-            print("    ↩ 候補不足のため「セット」除外から %d件を救済（ギフト系対策。効果効能の除外は戻さない）"
-                  % len(back))
-
     # --- 3. Amazon解決 ---
-    # Amazon searchItems は1件ごとに SLEEP_BETWEEN_AMAZON(1.1秒) 待つので、候補が多いほど遅い＆枠を食う。
-    # 最終プールは TARGET_MIN(8) 件なので、レビュー件数の多い上位 AMAZON_RESOLVE_MAX 件だけ照合すれば十分。
-    # ※これで1切り口の所要が半減（候補30→照合15）。無料枠・実行時間の節約になる。
-    kept.sort(key=lambda cand: -(cand.get("review_count") or 0))
-    if len(kept) > AMAZON_RESOLVE_MAX:
-        print("  照合を上位%d件に制限（レビュー件数順。残り%d件はスキップ＝枠節約）"
-              % (AMAZON_RESOLVE_MAX, len(kept) - AMAZON_RESOLVE_MAX))
-        kept = kept[:AMAZON_RESOLVE_MAX]
-
     c = amazon_conf()
     token = amazon_token(c)
     amz_direct = amazon_direct_asins(c, token, kw)
@@ -920,11 +859,6 @@ def main():
                              -learn_score(r["amazon"].get("brand")),
                              -r["consensus"],
                              -(r["candidate"].get("review_count") or 0)))
-    # 同ブランドの色/サイズ/個数違いを畳む（親ASINが返らない分の補完。上位を残す）
-    before_var = len(uniq)
-    uniq = collapse_variants(uniq)
-    if before_var != len(uniq):
-        print("    同ブランドの色/サイズ/個数違いを %d件 畳み込み" % (before_var - len(uniq)))
     multi = sum(1 for r in uniq if r["consensus"] >= 2)
     print("\n[5] 重複排除＋多源コンセンサス: %d件 → %d件（うち複数ソース一致=%d件）"
           % (len(resolved), len(uniq), multi))
@@ -932,6 +866,42 @@ def main():
         _bw = LEARN.get("brand_weight") or {}
         _fs = LEARN.get("few_shot") or []
         print("    学習を適用：ブランド重み%d件・お手本%d件（承認/👍👎から）" % (len(_bw), len(_fs)))
+
+    # --- 6.（先に）AIリランク＋関連性フィルタ：切り口に用途が合わない商品を落とす ---
+    #     ※プールを TARGET_MIN 件に絞る前に、全候補(uniq)を採点し、スコアが低い（＝
+    #       切り口の用途に合わない。例: 「おむつ」でヒットしたおむつゴミ箱/犬用おむつ）
+    #       を除外してから選ぶ。これにより先読みでも用途違いが並ばない。
+    reranked = False
+    if want_rerank:
+        gconf = load_gemini_conf()
+        if gconf:
+            print("\n[6] AIリランク（Gemini %s）で切り口適合度を採点し用途不一致を除外…" % gconf["model"])
+            _few = (LEARN.get("few_shot") if LEARN else None) or None
+            uniq, reranked = gemini_rerank(gconf, kw, uniq, few_shot=_few)
+            if reranked:
+                REL_MIN = 45   # これ未満は「切り口に用途が合わない」とみなす除外閾値
+                relevant = [r for r in uniq if (r.get("ai_score") or 0) >= REL_MIN]
+                off = [r for r in uniq if (r.get("ai_score") or 0) < REL_MIN]
+                if len(relevant) >= TARGET_MIN:
+                    if off:
+                        print("    関連性フィルタ：用途不一致 %d件を除外（スコア<%d）" % (len(off), REL_MIN))
+                    uniq = relevant
+                elif relevant:
+                    off.sort(key=lambda r: -(r.get("ai_score") or 0))
+                    need = TARGET_MIN - len(relevant)
+                    print("    関連性フィルタ：関連%d件＋高スコア補充%d件（関連品が目標未満のため空にしない）"
+                          % (len(relevant), need))
+                    uniq = relevant + off[:need]
+                # relevant が0件（全滅）なら uniq は変えず従来動作
+        else:
+            print("\n[6] AIリランク: gemini_api.json が無い/未設定のためスキップ")
+
+    # --- 7. ブランド多様性：同ブランドばかりにならないよう間引く（上位優先・空にしない） ---
+    _before_div = len(uniq)
+    uniq = diversify_brands(uniq)
+    if _before_div != len(uniq):
+        print("    ブランド多様性：同ブランド超過分を %d件 後方へ（1ブランド最大%d件）"
+              % (_before_div - len(uniq), MAX_PER_BRAND))
 
     # --- 空にしない：目標件数に満たなければ 要確認→保留 を繰り上げ ---
     adopted = [r for r in uniq if r["verdict"] == "採用"]
@@ -945,17 +915,6 @@ def main():
                         break
             if len(pool) >= TARGET_MIN:
                 break
-
-    # --- 6.（任意）AIリランク：切り口適合度で並べ替え ---
-    reranked = False
-    if want_rerank:
-        gconf = load_gemini_conf()
-        if gconf:
-            print("\n[6] AIリランク（Gemini %s）で切り口適合度に並べ替え…" % gconf["model"])
-            _few = (LEARN.get("few_shot") if LEARN else None) or None
-            pool, reranked = gemini_rerank(gconf, kw, pool, few_shot=_few)
-        else:
-            print("\n[6] AIリランク: gemini_api.json が無い/未設定のためスキップ")
 
     print("\n" + "=" * 62)
     print("最終プール（%d件）: 採用%d / 要確認%d / 保留%d"
@@ -989,6 +948,7 @@ def main():
             "price": r["amazon"].get("price"),
             "url": r["amazon"].get("url"),
             "image_url": r["amazon"].get("image"),
+            "features": (r["amazon"].get("features") or [])[:5],
             "source_candidate": r["candidate"].get("name"),
             "candidate_source": r["candidate"].get("source"),
             "review_count": r["candidate"].get("review_count"),
