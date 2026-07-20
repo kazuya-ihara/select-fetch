@@ -122,9 +122,15 @@ def clean_price(p):
     return int(digits) if digits else None
 
 
-def build_pool(kw, rerank):
-    """build_candidates.py を --json で呼び、最終プールの配列を返す。"""
+def build_pool(kw, rerank, theme="", angle="", components=None):
+    """検索kwと切り口意図を分離して build_candidates.py へ渡す。"""
     cmd = [sys.executable, BUILD, kw, "--json"]
+    if theme:
+        cmd += ["--theme", theme]
+    if angle:
+        cmd += ["--intent", angle]
+    if components:
+        cmd += ["--components-json", json.dumps(components, ensure_ascii=False)]
     if rerank:
         cmd.append("--rerank")
     # 子プロセス(build_candidates)が Gemini共有予算RPC を叩けるよう SUPABASE_URL を渡す。
@@ -181,7 +187,7 @@ def to_rows(pool):
 
 
 # ---------- 1切り口を取得して保存 ----------
-def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force):
+def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force, components=None):
     label = "%s / %s" % (theme, angle or "(テーマ単位)")
     # ピン留め判定
     if not force:
@@ -201,10 +207,16 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force):
         return "limit"
 
     print("  ▶ 取得: %s（kw=%s）rerank=%s" % (label, kw, rerank))
-    pool = build_pool(kw, rerank)
+    pool = build_pool(kw, rerank, theme=theme, angle=angle, components=components)
     if not pool:
         print("  × プールが空。保存せず。"); return "empty"
     rows = to_rows(pool)
+    if not rows:
+        print("  × 有効なASINが0件。保存せず。"); return "empty"
+    # 防御的ガード：本番の--rerank経路では、未採点や閾値未満が1件でも混じれば保存しない。
+    if rerank and any(r.get("ai_score") is None or r.get("ai_score") < 45 for r in rows):
+        print("  ⚠ 品質ゲート違反（未採点/45未満）。保存せず既存データを保護: %s" % label)
+        return "empty"
     usage_bump()
     # 安全ガード：AIリランクを頼んだのに全件スコア無し＝Gemini無料枠切れ/失敗。
     # その結果で既存の“AIフィルタ済み”データを上書きすると関連性が落ちるので、
@@ -234,7 +246,7 @@ def main():
     ap.add_argument("--theme")
     ap.add_argument("--angle", default="")
     ap.add_argument("--kw")
-    ap.add_argument("--queue", help="{theme,angle_title,kw} のJSON配列ファイル（夜間先読み用）")
+    ap.add_argument("--queue", help="{theme,angle_title,kw,components} のJSON配列ファイル（夜間先読み用）")
     ap.add_argument("--limit", type=int, default=10, help="キューから取得する最大件数")
     ap.add_argument("--date", default=None,
                     help="catalog_date（既定=Supabaseの最新カタログ日／取れなければ今日）")
@@ -267,18 +279,20 @@ def main():
             print("‼ キュー読込失敗:", e); sys.exit(1)
         for e in q:
             kw = e.get("kw") or e.get("angle_title") or e.get("theme")
-            jobs.append((e.get("theme", ""), e.get("angle_title", ""), kw))
+            jobs.append((e.get("theme", ""), e.get("angle_title", ""), kw,
+                         e.get("components") or []))
     elif args.theme and args.kw:
-        jobs.append((args.theme, args.angle, args.kw))
+        jobs.append((args.theme, args.angle, args.kw, []))
     else:
         print("‼ 使い方: --theme/--kw（1件）か --queue（先読み）。--help 参照"); sys.exit(1)
 
     stats = {"saved": 0, "skip": 0, "empty": 0, "error": 0, "limit": 0}
     done_fetch = 0
-    for theme, angle, kw in jobs:
+    for theme, angle, kw, components in jobs:
         if args.queue and done_fetch >= args.limit:
             print("  上限 %d 件に達したので停止。" % args.limit); break
-        r = fetch_and_save(token, args.date, theme, angle, kw, args.rerank, args.force)
+        r = fetch_and_save(token, args.date, theme, angle, kw, args.rerank, args.force,
+                           components=components)
         stats[r] = stats.get(r, 0) + 1
         if r == "limit":
             break

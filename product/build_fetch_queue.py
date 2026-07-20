@@ -79,7 +79,12 @@ def main():
             if key in seen:
                 continue
             seen.add(key)
-            queue.append({"theme": name, "angle_title": title, "kw": kw})
+            queue.append({
+                "theme": name,
+                "angle_title": title,
+                "kw": kw,
+                "components": a.get("c") or [],
+            })
             picked += 1
             if picked >= PER_THEME or len(queue) >= MAX_ANGLES:
                 break

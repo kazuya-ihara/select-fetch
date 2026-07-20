@@ -8,7 +8,7 @@
   2. 除外       : (a) セット/まとめ買いタイトル除外（単品優先）
                   (b) 効果効能カテゴリ＋怪しい効能表現の backstop 除外（薬機法/景表法/PSE）
   3. Amazon解決 : Creators API searchItems で正規ASIN/URL/ブランド/価格
-  4. 照合ゲート : Amazon結果と候補のブランド一致 → 採用/要確認/保留 の段階化（空にしない）
+  4. 照合ゲート : Amazon結果と候補のブランド一致 → 採用/要確認/保留 の段階化
   5. 重複排除   : ASIN／親ASIN／正規化タイトルで名寄せ（カラバリ集約）
 
 このスクリプトは「読むだけ・保存しない」。Supabase 保存や発火は後続タスク③で別ファイル。
@@ -25,18 +25,20 @@
     AIリランク時のみ product/gemini_api.json（example をコピー）。--rerank 指定時だけ呼ぶ。
     値はチャットに貼らない。ファイルにだけ置く。
 """
-import os, sys, re, json, time, base64, unicodedata
+import os, sys, re, json, time, base64, unicodedata, argparse, hashlib
 import urllib.parse, urllib.request, urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHOP = os.path.join(HERE, "shopping_api.json")
 AMZ = os.path.join(HERE, "amazon_creators.json")
 
-# 目標件数（プールの下限。足りなければ 要確認→保留 を繰り上げて埋める）
-TARGET_MIN = 9
-# 検索で集める生候補の下限。除外・Amazon照合で落ちる分を見込んで目標の3倍を確保する。
-POOL_MIN = TARGET_MIN * 3
-# 1ブランドの最大表示数（同ブランドばかりにならないよう多様性を確保。足りなければ緩める）
+# 表示件数の上限。足りない時も不適合商品では埋めない。
+TARGET_MAX = 9
+# AI関連性の表示下限。これ未満の候補は件数に関係なく表示しない。
+REL_MIN = 45
+# 検索で集める生候補の下限。除外・Amazon照合で落ちる分を見込んで上限の3倍を確保する。
+POOL_MIN = TARGET_MAX * 3
+# 1ブランドの最大表示数。同ブランドの超過分で空きを埋めない。
 MAX_PER_BRAND = 2
 # Amazon照合する候補の上限。照合は1件ずつAPIを叩くので多いと激遅（先読み全体がタイムアウト）。
 #   ※gather はAI変換クエリ→テーマ→修飾 の順に集めるので、先頭ほど「切り口の本命」。
@@ -120,6 +122,64 @@ def norm(s):
         return ""
     s = unicodedata.normalize("NFKC", str(s))
     return s.lower().strip()
+
+
+def normalize_components(components):
+    """カタログの c=[[種別, 値], ...] を安全なリストへ正規化する。"""
+    out = []
+    for row in components or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        kind, value = str(row[0]).strip(), str(row[1]).strip()
+        if kind and value:
+            out.append([kind, value])
+    return out
+
+
+def build_intent_spec(theme, angle_title, search_kw, components=None):
+    """検索語と選定意図を分離する。
+
+    search_kw は外部EC検索専用。AIのクエリ展開・採点・キャッシュには、切り口タイトルと
+    構造化要素を含む intent_text / intent_key を使い、同じkwを持つ別切り口の混線を防ぐ。
+    """
+    components = normalize_components(components)
+    theme = (theme or "").strip()
+    angle_title = (angle_title or search_kw or "").strip()
+    search_kw = (search_kw or angle_title or theme).strip()
+    grouped = {}
+    for kind, value in components:
+        grouped.setdefault(kind, []).append(value)
+
+    labels = {
+        "nayami": "最優先の悩み・目的",
+        "buy": "買い軸",
+        "attr": "対象属性",
+        "scene": "利用シーン",
+    }
+    lines = ["テーマ: %s" % (theme or "未指定"), "切り口タイトル: %s" % angle_title]
+    for kind in ("nayami", "buy", "attr", "scene"):
+        values = grouped.get(kind) or []
+        if values:
+            lines.append("%s: %s" % (labels[kind], " / ".join(values)))
+    lines.append("検索用キーワード（意図そのものではない）: %s" % search_kw)
+    intent_text = "\n".join(lines)
+
+    basis = json.dumps({
+        "theme": theme,
+        "angle_title": angle_title,
+        "search_kw": search_kw,
+        "components": components,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+    intent_key = "%s|%s" % (digest, _norm_key(angle_title)[:80])
+    return {
+        "theme": theme,
+        "angle_title": angle_title,
+        "search_kw": search_kw,
+        "components": components,
+        "intent_text": intent_text,
+        "intent_key": intent_key,
+    }
 
 
 # ============================================================
@@ -283,7 +343,7 @@ def gather_candidates(app_id, access_key, cid, kw, min_need=None, extra_queries=
     関連度は後段のGeminiリランクが本来の切り口(kw全体)で並べ替えるので、広めに集めてよい。
 
     min_need は「除外・Amazon照合で落ちる分」を見込んで目標件数の3倍にする。
-    ※以前は TARGET_MIN(8) で打ち切っていたため、候補8件→除外/照合落ちで最終1件、
+    ※以前は表示目標件数だけで打ち切っていたため、候補8件→除外/照合落ちで最終1件、
       という切り口（例：炭酸水）が出ていた。プールを厚くして取りこぼしを防ぐ。
     戻り値: (候補list, 実際に投げたクエリlog)
     """
@@ -305,11 +365,49 @@ def gather_candidates(app_id, access_key, cid, kw, min_need=None, extra_queries=
             nm = r.get("name") or ""
             k = (r.get("source"), norm(nm))
             if nm and k not in seen:
+                r["_search_query"] = q
                 seen.add(k); cands.append(r); added += 1
         tried.append("%s(+%d)" % (q, added))
         if len(cands) >= min_need and i >= MIN_QUERIES - 1:
             break
     return cands, tried
+
+
+def select_resolve_candidates(candidates, limit=AMAZON_RESOLVE_MAX, max_per_known_brand=3):
+    """Amazon解決枠を検索クエリ×取得元へラウンドロビン配分する。
+
+    先頭クエリやSEOの強い1ブランドが全14枠を独占するのを防ぐ。ブランド不明が多い
+    楽天候補はクエリ×取得元の分散で補い、既知ブランドは解決前にも緩い上限を設ける。
+    """
+    lanes = {}
+    lane_order = []
+    for cand in candidates or []:
+        lane = (cand.get("_search_query") or "", cand.get("source") or "")
+        if lane not in lanes:
+            lanes[lane] = []
+            lane_order.append(lane)
+        lanes[lane].append(cand)
+
+    picked, brand_counts = [], {}
+    while len(picked) < limit:
+        progressed = False
+        for lane in lane_order:
+            rows = lanes[lane]
+            while rows:
+                cand = rows.pop(0)
+                brand = _norm_brand(cand.get("brand"))
+                if brand and brand_counts.get(brand, 0) >= max_per_known_brand:
+                    continue
+                picked.append(cand)
+                if brand:
+                    brand_counts[brand] = brand_counts.get(brand, 0) + 1
+                progressed = True
+                break
+            if len(picked) >= limit:
+                break
+        if not progressed:
+            break
+    return picked
 
 
 def yahoo(cid, kw, hits=15):
@@ -707,26 +805,28 @@ def _fewshot_sig(few_shot):
     return hashlib.md5("\n".join(sorted(str(x) for x in few_shot)).encode("utf-8")).hexdigest()[:8]
 
 
-def _qkey(angle_kw):
-    return "q1|" + _norm_key(angle_kw)                         # q1 = クエリ変換プロンプト版
+def _qkey(intent_key):
+    # q2 = 切り口タイトル・構造化意図を含むキャッシュ契約。q1とは安全に共存する。
+    return "q2|" + _norm_key(intent_key)
 
 
-def _skey(angle_kw, few_shot):
-    return "s1|%s|%s" % (_fewshot_sig(few_shot), _norm_key(angle_kw))   # s1 = 採点プロンプト版
+def _skey(intent_key, few_shot):
+    # s2 = AI入力に切り口全文・構造化意図・商品featuresを含める採点プロンプト版。
+    return "s2|%s|%s" % (_fewshot_sig(few_shot), _norm_key(intent_key))
 
 
-def _cache_query_get(angle_kw):
-    r = _sb_rpc("v2_ai_query_get", {"p_angle_key": _qkey(angle_kw)})
+def _cache_query_get(intent_key):
+    r = _sb_rpc("v2_ai_query_get", {"p_angle_key": _qkey(intent_key)})
     return [str(x) for x in r] if isinstance(r, list) else None
 
 
-def _cache_query_put(angle_kw, queries):
-    _sb_rpc("v2_ai_query_put", {"p_angle_key": _qkey(angle_kw),
+def _cache_query_put(intent_key, queries):
+    _sb_rpc("v2_ai_query_put", {"p_angle_key": _qkey(intent_key),
                                 "p_queries": list(queries or []), "p_model": "gemini"})
 
 
-def _cache_score_get(angle_kw, few_shot, asins):
-    r = _sb_rpc("v2_ai_score_get", {"p_angle_key": _skey(angle_kw, few_shot),
+def _cache_score_get(intent_key, few_shot, asins):
+    r = _sb_rpc("v2_ai_score_get", {"p_angle_key": _skey(intent_key, few_shot),
                                     "p_asins": list(asins or [])})
     out = {}
     if isinstance(r, list):
@@ -736,9 +836,9 @@ def _cache_score_get(angle_kw, few_shot, asins):
     return out
 
 
-def _cache_score_put(angle_kw, few_shot, items):
+def _cache_score_put(intent_key, few_shot, items):
     if items:
-        _sb_rpc("v2_ai_score_put", {"p_angle_key": _skey(angle_kw, few_shot),
+        _sb_rpc("v2_ai_score_put", {"p_angle_key": _skey(intent_key, few_shot),
                                     "p_items": items, "p_model": "gemini"})
 
 
@@ -832,37 +932,30 @@ def _gender_of(title):
     return None   # 両用・不明は性別に依らず残す
 
 
-def gender_consistency(items, target=TARGET_MIN):
-    """性別のある商品が混在する場合、多数派の性別＋両用に揃える（少数派を後方へ）。
+def gender_consistency(items):
+    """性別のある商品が混在する場合、多数派の性別＋両用に揃える。
     ・明確に性別付きの商品が2種類とも一定数ある時だけ作動（家電/食品等は無影響）。
-    ・揃えると target 未満になる場合は少数派を戻して空にしない。"""
+    ・表示件数を埋めるために少数派を戻さない。"""
     fem = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) == "f"]
     mal = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) == "m"]
     if len(fem) < 2 or len(mal) < 2:
         return items   # 片方しか無い/性別商品でない → そのまま
     keep_g = "f" if len(fem) >= len(mal) else "m"   # 多数派に寄せる
-    primary = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) in (keep_g, None)]
-    minority = [r for r in items if _gender_of(r.get("amazon", {}).get("title")) not in (keep_g, None)]
-    if len(primary) < target and minority:
-        primary += minority[:target - len(primary)]
-    return primary
+    return [r for r in items if _gender_of(r.get("amazon", {}).get("title")) in (keep_g, None)]
 
 
-def diversify_brands(items, max_per=MAX_PER_BRAND, target=TARGET_MIN):
+def diversify_brands(items, max_per=MAX_PER_BRAND):
     """並び済みリストから、同ブランドが max_per を超えないように選ぶ（多様性確保）。
     ・上位（＝良い順）から、各ブランド max_per 件までを採用。
-    ・超過分は overflow へ退避し、目標件数に満たない時だけ良い順で補充（＝空にしない）。
+    ・超過分は表示件数を満たすために戻さない。
     戻り値：多様性を効かせた並び済みリスト。"""
-    picked, overflow, counts = [], [], {}
+    picked, counts = [], {}
     for r in items:
         b = _norm_brand(r.get("amazon", {}).get("brand"))
         if b and counts.get(b, 0) >= max_per:
-            overflow.append(r)
             continue
         picked.append(r)
         counts[b] = counts.get(b, 0) + 1
-    if len(picked) < target and overflow:
-        picked += overflow[:target - len(picked)]
     return picked
 
 
@@ -923,13 +1016,13 @@ def _budget_exhaust():
                 _BUDGET["used"] = u
 
 
-def gemini_expand_queries(conf, angle_kw):
+def gemini_expand_queries(conf, intent_text, intent_key):
     """切り口(検索意図)を、楽天/Yahooで“本命の商品”に当たる具体的な検索クエリ2〜4個へ変換する。
     肝：切り口の概念語(盗難/場所取り/食いつき/高さ 等)は、そのままでは商品名にないため、
         それを満たす具体的な商品名・カテゴリに翻訳する（盗難→自転車 鍵/U字ロック 等）。
     これを gather_candidates の extra_queries（最優先クエリ）に渡すと、本命が候補プールに入る。
     失敗時は [] を返し、通常の plan_queries にフォールバックする。"""
-    cached = _cache_query_get(angle_kw)
+    cached = _cache_query_get(intent_key)
     if cached is not None:
         return cached          # 資産キャッシュから即返す（Geminiを呼ばない）
     # expandは“あると良い”寄り。共有予算が細ったら省略し、rerank用の枠を温存する。
@@ -949,7 +1042,7 @@ def gemini_expand_queries(conf, angle_kw):
         "それを解決する『最も具体的な商品カテゴリ』に翻訳する。テーマの総称や“近いが別物”で妥協しない。\n"
         "   例) 自転車 盗難 → 「自転車 鍵 U字ロック」「自転車 GPS 盗難防止」\n"
         "       花火大会 場所取り → 「レジャーシート 大判」\n"
-        "       枕 高さ → 「高さ調整枕」（抱き枕・低反発だが高さ非調整は狙わない）\n"
+        "       枕 高さで選ぶ → 「枕 高さ 低め」「枕 高さ 10cm」（高さ調整は切り口が明示した時だけ）\n"
         "       シニア犬 食いつき ドッグフード → 「シニア犬 ドッグフード 嗜好性」\n"
         "       浴衣 着付け → 「着付け 帯 クリップ」「浴衣 帯板」（浴衣本体ではない）\n"
         "       ノート かさばる → 「薄型 ノート」「方眼 ノート 薄い」（普通のノートではない）\n"
@@ -963,7 +1056,7 @@ def gemini_expand_queries(conf, angle_kw):
         "5) 衣類・履物・下着など“性別のある商品”で切り口に性別指定が無い場合は、"
         "レディース向けで統一する（文脈でメンズが自然ならメンズで統一。性別を混在させない）。\n"
         "出力は必ずJSON配列（文字列の配列）のみ: [\"クエリ1\",\"クエリ2\",...]\n\n"
-        "切り口: " + angle_kw)
+        "切り口の構造化情報:\n" + intent_text)
     url = ("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
            % (conf["model"], conf["api_key"]))
     body = json.dumps({
@@ -998,28 +1091,44 @@ def gemini_expand_queries(conf, angle_kw):
             if q and q not in out:
                 out.append(q)
         out = out[:4]
-        _cache_query_put(angle_kw, out)   # 資産に保存（次回以降は0コスト）
+        _cache_query_put(intent_key, out)   # 資産に保存（次回以降は0コスト）
         return out
     except Exception:
         return []
 
 
 def _rerank_sort(pool):
-    """並べ替え：採用優先 → AIスコア高い → 学習ブランド重み → コンセンサス多い → レビュー多い。"""
-    pool.sort(key=lambda r: (VERDICT_ORDER[r["verdict"]],
-                             -(r.get("ai_score") if r.get("ai_score") is not None else -1),
+    """並べ替え：AI関連性を主役にし、照合確度(verdict)は同点調整にだけ使う。"""
+    pool.sort(key=lambda r: (-(r.get("ai_score") if r.get("ai_score") is not None else -1),
+                             VERDICT_ORDER[r["verdict"]],
                              -learn_score(r["amazon"].get("brand")),
                              -r["consensus"],
                              -(r["candidate"].get("review_count") or 0)))
 
 
-def gemini_rerank(conf, angle_kw, pool, few_shot=None):
+def select_final_pool(items, require_ai=True, rel_min=REL_MIN,
+                      target_max=TARGET_MAX, max_per_brand=MAX_PER_BRAND):
+    """適格候補だけから最大 target_max 件を選ぶ。
+
+    rejectされた候補を件数合わせで復活させないことが、この関数の最重要契約。
+    """
+    pool = list(items or [])
+    if require_ai:
+        pool = [r for r in pool
+                if r.get("ai_score") is not None and r.get("ai_score") >= rel_min]
+    _rerank_sort(pool)
+    pool = gender_consistency(pool)
+    pool = diversify_brands(pool, max_per=max_per_brand)
+    return pool[:target_max]
+
+
+def gemini_rerank(conf, intent_text, intent_key, pool, few_shot=None):
     """poolを切り口適合度でリランク。各itemに ai_score(0-100)/ai_reason を付与。
        資産キャッシュ（切り口×ASIN→スコア）を優先し、未キャッシュ分だけGeminiで採点する。
        few_shot=過去の👍商品。失敗時はpoolをそのまま返す。"""
     # 1) 資産キャッシュを適用：既知の(切り口×ASIN)はDBから即スコア（Geminiを使わない）
     asins = [r["amazon"].get("asin") for r in pool if r["amazon"].get("asin")]
-    cached = _cache_score_get(angle_kw, few_shot, asins) if asins else {}
+    cached = _cache_score_get(intent_key, few_shot, asins) if asins else {}
     todo = []
     for r in pool:
         a = r["amazon"].get("asin")
@@ -1043,9 +1152,10 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
     lines = []
     for i, r in enumerate(todo, 1):
         amz = r["amazon"]
-        lines.append("%d) %s | ブランド:%s | 価格:%s | %d源一致 | レビュー%s件"
+        features = " / ".join(str(x).strip() for x in (amz.get("features") or [])[:3])[:280]
+        lines.append("%d) %s | ブランド:%s | 特徴:%s | 価格:%s | %d源一致 | レビュー%s件"
                      % (i, (amz.get("title") or "")[:70], amz.get("brand") or "-",
-                        amz.get("price") or "-", r["consensus"],
+                        features or "-", amz.get("price") or "-", r["consensus"],
                         r["candidate"].get("review_count") or "?"))
     fewshot_txt = ""
     if few_shot:
@@ -1058,6 +1168,9 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
         "シーン語（週末ライド/通勤/花火大会 等）だけ合っても、その悩み・目的を解決しない商品は大きく減点。"
         "例)『週末ライドでの「盗難」を抑える』では、盗難を防ぐ鍵/ロック/GPSが高評価、"
         "サイクルウェア等“ライドで使うが盗難と無関係”な商品は20点以下。\n"
+        "【買い軸】『○○で選ぶ』の○○は比較に必要な条件です。タイトルまたは特徴にその属性の"
+        "具体的な証拠が無ければ30点以下。ただし『高さで選ぶ』は固定高さの明記でもよく、"
+        "『高さ調整で選ぶ』と明記された場合だけ調整式を必須にしてください。\n"
         "【最重要】切り口が求める“商品カテゴリ・用途・形状”に合わないものは大きく減点（20点以下）してください。\n"
         "  - 別カテゴリの無関係な商品（例：イヤホンの切り口にキーケース/ゴミ箱/ペット用品）＝ほぼ0点。\n"
         "  - “近いが別物”（同じテーマ内でも悩みが求めるサブカテゴリと違う）も減点。例：\n"
@@ -1067,7 +1180,7 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
         "コードが邪魔で外れやすい“有線”や、固定力の弱い開放型は低評価。『高音質でじっくり』なら逆に許容）。\n"
         "ブランドの信頼性・不自然な煽り/粗悪さも加味し、価格の高安だけで過度に上下させないこと。\n"
         "出力は必ずJSON配列のみ: [{\"i\":番号,\"score\":整数,\"reason\":\"20字程度の理由\"}]\n\n"
-        "切り口: " + angle_kw + fewshot_txt + "\n\n商品一覧:\n" + "\n".join(lines))
+        "切り口の構造化情報:\n" + intent_text + fewshot_txt + "\n\n商品一覧:\n" + "\n".join(lines))
 
     url = ("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
            % (conf["model"], conf["api_key"]))
@@ -1115,7 +1228,7 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
         a = r["amazon"].get("asin")
         if a and r["ai_score"] is not None:
             new_items.append({"asin": a, "score": r["ai_score"], "reason": r["ai_reason"]})
-    _cache_score_put(angle_kw, few_shot, new_items)   # 新規採点を資産に追加（次回以降0コスト）
+    _cache_score_put(intent_key, few_shot, new_items)   # 新規採点を資産に追加（次回以降0コスト）
     _rerank_sort(pool)
     print("    AIスコア: %d件キャッシュ + %d件新規採点" % (len(pool) - len(todo), len(todo)))
     return pool, True
@@ -1125,24 +1238,40 @@ def gemini_rerank(conf, angle_kw, pool, few_shot=None):
 # メイン
 # ============================================================
 def main():
-    args = [a for a in sys.argv[1:] if a.strip()]
-    want_json = "--json" in args
-    want_rerank = "--rerank" in args
-    args = [a for a in args if a not in ("--json", "--rerank")]
-    kw = " ".join(args) or "ソロ キャンプ 軽量"
+    ap = argparse.ArgumentParser(description="切り口に合うAmazon商品候補を生成")
+    ap.add_argument("query", nargs="*", help="外部EC検索用キーワード")
+    ap.add_argument("--theme", default="", help="テーマ名")
+    ap.add_argument("--intent", default="", help="切り口タイトル（AI選定意図）")
+    ap.add_argument("--components-json", default="[]",
+                    help='切り口要素のJSON（例: [["nayami","パンク"]]）')
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--rerank", action="store_true")
+    ns = ap.parse_args()
+    want_json = ns.json
+    want_rerank = ns.rerank
+    kw = " ".join(ns.query).strip() or "ソロ キャンプ 軽量"
+    try:
+        components = json.loads(ns.components_json)
+    except Exception:
+        print("    切り口要素JSONの解析失敗。要素なしで続行")
+        components = []
+    intent = build_intent_spec(ns.theme, ns.intent, kw, components)
 
     load_learning()   # ⑤ learning.json があればブランド重み＋お手本を適用（無ければ通常動作）
     app_id, access_key, cid = load_shop_conf()
     print("=" * 62)
     print("検索キーワード:", kw)
+    print("選定する切り口:", intent["angle_title"])
     print("=" * 62)
 
     # AIクエリ変換（--rerank時のみ・Gemini設定があれば）。切り口の概念語を具体的な商品語へ
     #   翻訳し、gather の最優先クエリにする（例：自転車 盗難→自転車 鍵/U字ロック）。
     gconf = load_gemini_conf() if want_rerank else None
+    if want_rerank and not gconf:
+        emit_empty(want_json, "AI設定が無いため、未採点候補は公開しません")
     ai_queries = []
     if gconf:
-        ai_queries = gemini_expand_queries(gconf, kw)
+        ai_queries = gemini_expand_queries(gconf, intent["intent_text"], intent["intent_key"])
         if ai_queries:
             print("[0] AIクエリ変換 → " + " / ".join(ai_queries))
 
@@ -1169,16 +1298,18 @@ def main():
     if flags:
         print("    （弱フラグ %d件：中華製ヒント。除外はしない）" % len(flags))
 
-    # Amazon照合は1件ずつAPIを叩くので、多いと激遅（先読みがタイムアウト）。上位のみに制限。
-    #   gather順（AI変換クエリ→テーマ→修飾）のまま先頭を残すので、切り口の本命が優先される。
+    # Amazon照合は1件ずつAPIを叩くので上限を維持しつつ、クエリ×取得元へ枠を分散する。
+    # 先頭クエリやSEOの強いブランドが全枠を独占しないようにする。
     if len(kept) > AMAZON_RESOLVE_MAX:
-        print("    照合を上位 %d件 に制限（全 %d件中／速度確保）" % (AMAZON_RESOLVE_MAX, len(kept)))
-        kept = kept[:AMAZON_RESOLVE_MAX]
+        print("    照合を分散選抜した %d件 に制限（全 %d件中／速度確保）"
+              % (AMAZON_RESOLVE_MAX, len(kept)))
+    kept = select_resolve_candidates(kept)
 
     # --- 3. Amazon解決 ---
     c = amazon_conf()
     token = amazon_token(c)
-    amz_direct = amazon_direct_asins(c, token, kw)
+    direct_kw = ai_queries[0] if ai_queries else kw
+    amz_direct = amazon_direct_asins(c, token, direct_kw)
     time.sleep(SLEEP_BETWEEN_AMAZON)
     print("\n[3] Amazon解決: トークンOK。Amazon直接検索=%d ASIN（独立ソース）。%d件を searchItems で照会…"
           % (len(amz_direct), len(kept)))
@@ -1239,7 +1370,7 @@ def main():
         r["sources"] = sorted(src)
         r["consensus"] = len(src)
     uniq = list(best.values())
-    # 並び：採用優先 → コンセンサス多い → レビュー件数多い
+    # AI採点前の仮並び：照合確度 → 学習重み → コンセンサス → レビュー
     uniq.sort(key=lambda r: (VERDICT_ORDER[r["verdict"]],
                              -learn_score(r["amazon"].get("brand")),
                              -r["consensus"],
@@ -1258,7 +1389,7 @@ def main():
         print("    学習を適用：ブランド重み%d件・お手本%d件（承認/👍👎から）" % (len(_bw), len(_fs)))
 
     # --- 6.（先に）AIリランク＋関連性フィルタ：切り口に用途が合わない商品を落とす ---
-    #     ※プールを TARGET_MIN 件に絞る前に、全候補(uniq)を採点し、スコアが低い（＝
+    #     ※最終件数を決める前に全候補(uniq)を採点し、スコアが低い（＝
     #       切り口の用途に合わない。例: 「おむつ」でヒットしたおむつゴミ箱/犬用おむつ）
     #       を除外してから選ぶ。これにより先読みでも用途違いが並ばない。
     reranked = False
@@ -1267,50 +1398,23 @@ def main():
         if gconf:
             print("\n[6] AIリランク（Gemini %s）で切り口適合度を採点し用途不一致を除外…" % gconf["model"])
             _few = (LEARN.get("few_shot") if LEARN else None) or None
-            uniq, reranked = gemini_rerank(gconf, kw, uniq, few_shot=_few)
-            if reranked:
-                REL_MIN = 45   # これ未満は「切り口に用途が合わない」とみなす除外閾値
-                relevant = [r for r in uniq if (r.get("ai_score") or 0) >= REL_MIN]
-                off = [r for r in uniq if (r.get("ai_score") or 0) < REL_MIN]
-                if len(relevant) >= TARGET_MIN:
-                    if off:
-                        print("    関連性フィルタ：用途不一致 %d件を除外（スコア<%d）" % (len(off), REL_MIN))
-                    uniq = relevant
-                elif relevant:
-                    off.sort(key=lambda r: -(r.get("ai_score") or 0))
-                    need = TARGET_MIN - len(relevant)
-                    print("    関連性フィルタ：関連%d件＋高スコア補充%d件（関連品が目標未満のため空にしない）"
-                          % (len(relevant), need))
-                    uniq = relevant + off[:need]
-                # relevant が0件（全滅）なら uniq は変えず従来動作
-        else:
-            print("\n[6] AIリランク: gemini_api.json が無い/未設定のためスキップ")
+            uniq, reranked = gemini_rerank(
+                gconf, intent["intent_text"], intent["intent_key"], uniq, few_shot=_few)
+            if not reranked:
+                emit_empty(want_json, "AI採点が未完了。未採点候補は公開しません")
 
-    # --- 7a. 性別の統一：レディース/メンズが混在する切り口は多数派＋両用に揃える ---
-    _before_g = len(uniq)
-    uniq = gender_consistency(uniq)
-    if _before_g != len(uniq):
-        print("    性別統一：混在する少数派 %d件を後方へ" % (_before_g - len(uniq)))
-
-    # --- 7b. ブランド多様性：同ブランドばかりにならないよう間引く（上位優先・空にしない） ---
-    _before_div = len(uniq)
-    uniq = diversify_brands(uniq)
-    if _before_div != len(uniq):
-        print("    ブランド多様性：同ブランド超過分を %d件 後方へ（1ブランド最大%d件）"
-              % (_before_div - len(uniq), MAX_PER_BRAND))
-
-    # --- 空にしない：目標件数に満たなければ 要確認→保留 を繰り上げ ---
-    adopted = [r for r in uniq if r["verdict"] == "採用"]
-    pool = adopted[:]
-    if len(pool) < TARGET_MIN:
-        for v in ("要確認", "保留"):
-            for r in uniq:
-                if r["verdict"] == v and r not in pool:
-                    pool.append(r)
-                    if len(pool) >= TARGET_MIN:
-                        break
-            if len(pool) >= TARGET_MIN:
-                break
+    # --- 7. 適格候補だけから最大9件を選ぶ。除外候補・同ブランド超過分は復活させない。 ---
+    before_relevance = len(uniq)
+    pool = select_final_pool(uniq, require_ai=want_rerank)
+    if want_rerank:
+        rejected = before_relevance - sum(
+            1 for r in uniq if r.get("ai_score") is not None and r.get("ai_score") >= REL_MIN)
+        print("    関連性フィルタ：スコア<%d または未採点 %d件を不可逆に除外"
+              % (REL_MIN, rejected))
+    if not pool:
+        emit_empty(want_json, "品質基準を満たす商品が0件")
+    print("    最終選抜：最大%d件／1ブランド最大%d件（不足時も水増しなし）"
+          % (TARGET_MAX, MAX_PER_BRAND))
 
     print("\n" + "=" * 62)
     print("最終プール（%d件）: 採用%d / 要確認%d / 保留%d"
@@ -1355,7 +1459,8 @@ def main():
     print("\n==== 見方 ====")
     print("◎採用=ブランド/JAN一致で確度高い / △要確認=型番やブランド語の弱一致 / ▽保留=一致なし。")
     print("N源一致=同一ASINに何ソース(楽天/Yahoo/Amazon)が一致したか。多いほど信頼できる。")
-    print("並び順=採用優先→コンセンサス多い→レビュー件数多い。★足切りは⑤(Edge)で追加予定。")
+    print("並び順=AI適合→照合確度→学習重み→コンセンサス→レビュー。AI%d未満は表示しない。"
+          % REL_MIN)
 
 
 if __name__ == "__main__":

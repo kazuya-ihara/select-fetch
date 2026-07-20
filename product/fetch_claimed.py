@@ -42,12 +42,15 @@ def load_catalog(token, date=None):
     return None, None
 
 
-def kw_map(payload):
+def angle_map(payload):
     m = {}
     for theme, data in (payload.get("ANGLE_DATA") or {}).items():
         for a in (data.get("angles") or []):
             if a.get("t") and a.get("kw"):
-                m[(theme, a["t"])] = a["kw"]
+                m[(theme, a["t"])] = {
+                    "kw": a["kw"],
+                    "components": a.get("c") or [],
+                }
     return m
 
 
@@ -75,12 +78,12 @@ def main():
         print("対応済み切り口の取得に失敗:", type(e).__name__, e); sys.exit(1)
 
     # 対応日ごとにその日のカタログを読み、kwを引く（切り口名は日々変わるので日付を合わせる）
-    km_cache = {}   # cdate -> {(theme, angle): kw}
-    def km_for(cdate):
-        if cdate not in km_cache:
+    angle_cache = {}   # cdate -> {(theme, angle): {kw, components}}
+    def angles_for(cdate):
+        if cdate not in angle_cache:
             _, p = load_catalog(token, cdate) if cdate else (None, payload)
-            km_cache[cdate] = kw_map(p) if p else {}
-        return km_cache[cdate]
+            angle_cache[cdate] = angle_map(p) if p else {}
+        return angle_cache[cdate]
 
     # 直近7日の対応済み切り口を、その対応の catalog_date ごとに拾う（日付ズレに強い）
     targets, seen = [], set()
@@ -91,7 +94,8 @@ def main():
         if key in seen:
             continue
         seen.add(key)
-        targets.append((cdate, theme, angle, km_for(cdate).get((theme, angle))))
+        spec = angles_for(cdate).get((theme, angle))
+        targets.append((cdate, theme, angle, spec))
 
     print("=" * 60)
     print("最新カタログ=%s ／ 対応済み切り口=%d件（直近7日） ／ rerank=%s" % (date, len(targets), args.rerank))
@@ -102,12 +106,14 @@ def main():
 
     stats = {"saved": 0, "skip": 0, "empty": 0, "error": 0, "limit": 0, "nokw": 0}
     done_fetch = 0
-    for cdate, theme, angle, kw in targets:
+    for cdate, theme, angle, spec in targets:
         if done_fetch >= args.limit:
             print("  上限 %d 件に達したので停止。" % args.limit); break
+        kw = (spec or {}).get("kw")
         if not kw:
             print("  × kw不明（カタログに該当切り口なし）: %s / %s" % (theme, angle)); stats["nokw"] += 1; continue
-        r = pf.fetch_and_save(token, cdate, theme, angle, kw, args.rerank, args.force)
+        r = pf.fetch_and_save(token, cdate, theme, angle, kw, args.rerank, args.force,
+                              components=(spec or {}).get("components") or [])
         stats[r] = stats.get(r, 0) + 1
         if r == "limit":
             break
