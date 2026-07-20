@@ -41,13 +41,17 @@ class SelectionPolicyTest(unittest.TestCase):
         rows = [make_row(20, "A", n=1), make_row(5, "B", n=2)]
         self.assertEqual([], bc.select_final_pool(rows))
 
+    def test_borderline_score_is_not_displayed(self):
+        rows = [make_row(60, "A", n=1), make_row(70, "B", n=2)]
+        self.assertEqual([70], [r["ai_score"] for r in bc.select_final_pool(rows)])
+
     def test_ai_score_ranks_before_verdict(self):
         rows = [
-            make_row(60, "A", verdict="採用", n=1),
+            make_row(70, "A", verdict="採用", n=1),
             make_row(90, "B", verdict="保留", n=2),
         ]
         out = bc.select_final_pool(rows)
-        self.assertEqual([90, 60], [r["ai_score"] for r in out])
+        self.assertEqual([90, 70], [r["ai_score"] for r in out])
 
     def test_brand_limit_is_strict_even_when_list_is_short(self):
         rows = [make_row(95 - i, "独占ブランド", n=i) for i in range(5)]
@@ -60,6 +64,25 @@ class SelectionPolicyTest(unittest.TestCase):
     def test_target_is_maximum_not_minimum(self):
         rows = [make_row(90 - i, "B%d" % i, n=i) for i in range(12)]
         self.assertEqual(9, len(bc.select_final_pool(rows)))
+
+    def test_bulk_quantity_without_set_word_is_excluded(self):
+        for title in ("丸うちわ 白 無地 100枚 うちわ", "竹製うちわ 10本組"):
+            result = bc.classify_exclusion({"name": title, "source": "amazon"})
+            self.assertIsNotNone(result)
+            self.assertEqual("drop", result[0])
+
+    def test_lightweight_axis_requires_explicit_evidence(self):
+        unsupported = make_row(90, "A", title="21V 電動ドライバー コンパクト", n=1)
+        supported = make_row(80, "B", title="軽量 電動ドライバー", n=2)
+        out = bc.select_final_pool(
+            [unsupported, supported], components=[["buy", "軽い"]])
+        self.assertEqual([supported], out)
+
+    def test_uchiwa_axis_rejects_handheld_fan(self):
+        fan = make_row(90, "A", title="携帯扇風機 ハンディファン", n=1)
+        uchiwa = make_row(80, "B", title="竹製うちわ", n=2)
+        out = bc.select_final_pool([fan, uchiwa], components=[["buy", "うちわ"]])
+        self.assertEqual([uchiwa], out)
 
     def test_same_search_kw_different_angles_have_different_cache_keys(self):
         a = bc.build_intent_spec(

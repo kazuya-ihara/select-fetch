@@ -34,8 +34,9 @@ AMZ = os.path.join(HERE, "amazon_creators.json")
 
 # 表示件数の上限。足りない時も不適合商品では埋めない。
 TARGET_MAX = 9
-# AI関連性の表示下限。これ未満の候補は件数に関係なく表示しない。
-REL_MIN = 45
+# AI関連性の表示下限。中間点は「近いが主用途が別」の商品も含み得るため、
+# 明確に適合した70点以上だけを表示する。これ未満は件数に関係なく表示しない。
+REL_MIN = 70
 # 検索で集める生候補の下限。除外・Amazon照合で落ちる分を見込んで上限の3倍を確保する。
 POOL_MIN = TARGET_MAX * 3
 # 1ブランドの最大表示数。同ブランドの超過分で空きを埋めない。
@@ -55,6 +56,9 @@ SLEEP_BETWEEN_AMAZON = 0.6   # Amazon searchItems 連打の間隔（秒）
 # (a) セット/まとめ買い/複数個 → 単品優先で除外
 SET_PATTERNS = [
     r"セット", r"まとめ買い", r"まとめ売り", r"詰め合わせ", r"詰合せ",
+    # 「100枚 うちわ」「10本組」など、入/セットの語が省略された業務用数量も除外。
+    r"[0-9０-９]{2,}\s*(?:個|本|枚|袋|箱|パック)(?:入|入り|セット|組|パック)?",
+    r"[2-9２-９]\s*(?:個|本|枚|袋|箱|パック)(?:入|入り|セット|組|パック)",
     r"[0-9０-９]+\s*個(?:入|セット|組|パック|袋|本|枚|箱)",
     r"[0-9０-９]+\s*(?:個|本|枚|袋|箱|パック|セット|組)入",
     r"[0-9０-９]+\s*点(?:入り?|セット|組|パック)",   # 「2点入り」等の複数個パック
@@ -806,13 +810,13 @@ def _fewshot_sig(few_shot):
 
 
 def _qkey(intent_key):
-    # q2 = 切り口タイトル・構造化意図を含むキャッシュ契約。q1とは安全に共存する。
-    return "q2|" + _norm_key(intent_key)
+    # q4 = 具体商品名の代用品と業務用まとめ買いを検索段階から避ける版。
+    return "q4|" + _norm_key(intent_key)
 
 
 def _skey(intent_key, few_shot):
-    # s2 = AI入力に切り口全文・構造化意図・商品featuresを含める採点プロンプト版。
-    return "s2|%s|%s" % (_fewshot_sig(few_shot), _norm_key(intent_key))
+    # s3 = 構造化意図・featuresに加え、具体商品軸と軽量根拠を厳格化した採点版。
+    return "s3|%s|%s" % (_fewshot_sig(few_shot), _norm_key(intent_key))
 
 
 def _cache_query_get(intent_key):
@@ -1049,6 +1053,9 @@ def gemini_expand_queries(conf, intent_text, intent_key):
         "       犬 抜ける ハーネス → 「犬 ハーネス 脱走防止」\n"
         "       夏祭り 子連れ → 「子供 迷子防止 ハーネス」（下駄など祭りの衣類ではない）\n"
         "2) 切り口が指定する対象（シニア/新生児/レディース/メンズ 等）は必ずクエリに残す。\n"
+        "2.5) 買い軸が具体的な商品名（うちわ/コンロ/チューブ等）なら、その商品種そのものだけを狙い、"
+        "近い用途の代用品を混ぜない。例: うちわに扇子・ハンディファン・携帯扇風機を含めない。\n"
+        "2.6) 一般消費者が1つ買える単品を優先し、10本組・100枚・業務用ロット・ケース販売を狙わない。\n"
         "3) 各クエリは実際に商品タイトルに現れる2〜4語の日本語。抽象語だけのクエリは作らない。\n"
         "4) 商品カテゴリが曖昧な切り口（『こだわる〇〇グッズ』『カップル向けの〇〇』等）でも、"
         "その場面・目的で最も定番の具体商品を1〜2種類に絞って出す"
@@ -1106,14 +1113,43 @@ def _rerank_sort(pool):
                              -(r["candidate"].get("review_count") or 0)))
 
 
+_WEIGHT_EVIDENCE_RE = re.compile(
+    r"軽量|超軽量|軽い|重量|重さ|[0-9０-９]+(?:[\.,．][0-9０-９]+)?\s*(?:kg|g|キログラム|グラム)", re.I)
+
+
+def apply_axis_evidence(items, components=None):
+    """AIのソフト採点に、明示できる買い軸だけ決定的な証拠ゲートを重ねる。
+
+    全軸を単純な文字一致にすると誤除外が増えるため、現時点では証拠を安全に判定できる
+    軽量軸と、具体商品名である「うちわ」だけを対象にする。
+    """
+    axes = [norm(value) for kind, value in normalize_components(components) if kind == "buy"]
+    need_weight = any(axis in ("軽い", "軽量") for axis in axes)
+    need_uchiwa = "うちわ" in axes
+    for row in items or []:
+        amz = row.get("amazon") or {}
+        text = norm(" ".join([amz.get("title") or ""] + [str(x) for x in (amz.get("features") or [])]))
+        failures = []
+        if need_weight and not _WEIGHT_EVIDENCE_RE.search(text):
+            failures.append("買い軸『軽い』の重量・軽量根拠なし")
+        if need_uchiwa and not ("うちわ" in text or "団扇" in text):
+            failures.append("商品種『うちわ』ではない")
+        if failures and row.get("ai_score") is not None:
+            row["ai_score"] = min(row["ai_score"], 30)
+            suffix = " / ".join(failures)
+            row["ai_reason"] = (row.get("ai_reason") or "") + (" / " if row.get("ai_reason") else "") + suffix
+    return items
+
+
 def select_final_pool(items, require_ai=True, rel_min=REL_MIN,
-                      target_max=TARGET_MAX, max_per_brand=MAX_PER_BRAND):
+                      target_max=TARGET_MAX, max_per_brand=MAX_PER_BRAND, components=None):
     """適格候補だけから最大 target_max 件を選ぶ。
 
     rejectされた候補を件数合わせで復活させないことが、この関数の最重要契約。
     """
     pool = list(items or [])
     if require_ai:
+        apply_axis_evidence(pool, components)
         pool = [r for r in pool
                 if r.get("ai_score") is not None and r.get("ai_score") >= rel_min]
     _rerank_sort(pool)
@@ -1171,6 +1207,9 @@ def gemini_rerank(conf, intent_text, intent_key, pool, few_shot=None):
         "【買い軸】『○○で選ぶ』の○○は比較に必要な条件です。タイトルまたは特徴にその属性の"
         "具体的な証拠が無ければ30点以下。ただし『高さで選ぶ』は固定高さの明記でもよく、"
         "『高さ調整で選ぶ』と明記された場合だけ調整式を必須にしてください。\n"
+        "買い軸が具体的商品名なら別商品種を代用品として認めない。例:『うちわアイテム』の扇子・"
+        "ハンディファン・携帯扇風機は30点以下。『軽い』では重量値または軽量の明記を根拠とし、"
+        "小型・コンパクトというだけで軽いと推定しない。\n"
         "【最重要】切り口が求める“商品カテゴリ・用途・形状”に合わないものは大きく減点（20点以下）してください。\n"
         "  - 別カテゴリの無関係な商品（例：イヤホンの切り口にキーケース/ゴミ箱/ペット用品）＝ほぼ0点。\n"
         "  - “近いが別物”（同じテーマ内でも悩みが求めるサブカテゴリと違う）も減点。例：\n"
@@ -1405,7 +1444,7 @@ def main():
 
     # --- 7. 適格候補だけから最大9件を選ぶ。除外候補・同ブランド超過分は復活させない。 ---
     before_relevance = len(uniq)
-    pool = select_final_pool(uniq, require_ai=want_rerank)
+    pool = select_final_pool(uniq, require_ai=want_rerank, components=intent["components"])
     if want_rerank:
         rejected = before_relevance - sum(
             1 for r in uniq if r.get("ai_score") is not None and r.get("ai_score") >= REL_MIN)
