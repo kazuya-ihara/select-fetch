@@ -219,8 +219,8 @@ def validate_quality_promotion(rows, existing_count, rerank):
     拒否理由にせず、AIスコアの下限・平均・重複だけで安全性を担保する。
     旧結果の件数しか取得できないため、既存商品とのスコア比較は行わない。
     """
-    if existing_count is None or existing_count <= 0:
-        return False, "既存結果がないため昇格対象外"
+    if existing_count is None:
+        return False, "既存件数を確認できないため保留"
     ok, reason = validate_new_result(rows, rerank)
     if not ok:
         return False, reason
@@ -237,6 +237,8 @@ def validate_quality_promotion(rows, existing_count, rerank):
         return False, "最低AI%d点未満（最低=%d）" % (PROMOTE_MIN_SCORE, min_score)
     if avg_score < PROMOTE_AVG_SCORE:
         return False, "平均AI%d点未満（平均=%.1f）" % (PROMOTE_AVG_SCORE, avg_score)
+    if existing_count == 0:
+        return True, "新規登録・平均AI%.1f点" % avg_score
     return True, "最低AI%d点・平均AI%.1f点" % (min_score, avg_score)
 
 

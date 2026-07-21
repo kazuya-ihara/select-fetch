@@ -224,6 +224,13 @@ class SaveQualityTest(unittest.TestCase):
         ok, reason = product_fetch.validate_quality_promotion(rows, 9, rerank=True)
         self.assertTrue(ok, reason)
 
+    def test_quality_promotion_allows_new_high_quality_result(self):
+        rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90},
+                {"asin": "C", "ai_score": 85}, {"asin": "D", "ai_score": 80}]
+        ok, reason = product_fetch.validate_quality_promotion(rows, 0, rerank=True)
+        self.assertTrue(ok, reason)
+        self.assertIn("新規登録", reason)
+
     def test_quality_promotion_rejects_three_items_even_if_scores_are_high(self):
         rows = [{"asin": "A", "ai_score": 100}, {"asin": "B", "ai_score": 95},
                 {"asin": "C", "ai_score": 90}]
