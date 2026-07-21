@@ -63,13 +63,17 @@ class SelectionPolicyTest(unittest.TestCase):
 
     def test_target_is_maximum_not_minimum(self):
         rows = [make_row(90 - i, "B%d" % i, n=i) for i in range(12)]
-        self.assertEqual(9, len(bc.select_final_pool(rows)))
+        self.assertEqual(6, len(bc.select_final_pool(rows)))
 
     def test_bulk_quantity_without_set_word_is_excluded(self):
         for title in ("丸うちわ 白 無地 100枚 うちわ", "竹製うちわ 10本組"):
             result = bc.classify_exclusion({"name": title, "source": "amazon"})
             self.assertIsNotNone(result)
             self.assertEqual("drop", result[0])
+
+    def test_functional_retail_set_is_allowed(self):
+        for title in ("科学実験セット", "浴衣3点セット", "パンク修理キット"):
+            self.assertIsNone(bc.classify_exclusion({"name": title, "source": "amazon"}))
 
     def test_lightweight_axis_requires_explicit_evidence(self):
         unsupported = make_row(90, "A", title="21V 電動ドライバー コンパクト", n=1)
@@ -83,6 +87,61 @@ class SelectionPolicyTest(unittest.TestCase):
         uchiwa = make_row(80, "B", title="竹製うちわ", n=2)
         out = bc.select_final_pool([fan, uchiwa], components=[["buy", "うちわ"]])
         self.assertEqual([uchiwa], out)
+
+    def test_amazon_review_lane_breaks_ai_score_tie(self):
+        relevance = make_row(90, "A", n=1)
+        reviews = make_row(90, "B", n=2)
+        relevance["candidate"]["relevance_rank"] = 1
+        reviews["candidate"]["reviews_rank"] = 5
+        out = bc.select_final_pool([relevance, reviews])
+        self.assertEqual([reviews, relevance], out)
+
+    def test_product_type_diversity_is_used_before_overflow(self):
+        rows = [make_row(95 - i, "B%d" % i, n=i) for i in range(5)]
+        for row, product_type in zip(rows, ["テーブル", "テーブル", "テーブル", "チェア", "タープ"]):
+            row["product_type"] = product_type
+        out = bc.select_final_pool(rows, target_max=5)
+        self.assertEqual(["テーブル", "テーブル", "チェア", "タープ"],
+                         [r["product_type"] for r in out])
+
+    def test_unknown_product_type_does_not_block_good_candidates(self):
+        rows = [make_row(95 - i, "B%d" % i, n=i) for i in range(5)]
+        for row in rows:
+            row["product_type"] = "その他"
+        out = bc.select_final_pool(rows, target_max=5)
+        self.assertEqual(5, len(out))
+
+    def test_build_amazon_query_adds_problem_before_scene(self):
+        intent = bc.build_intent_spec(
+            "自転車・サイクル用品", "ロード初心者の「パンク」に応える", "自転車 ロード初心者",
+            [["nayami", "パンク"], ["attr", "ロード初心者"]])
+        self.assertEqual("自転車 ロード初心者 パンク", bc.build_amazon_query(intent, "自転車 ロード初心者"))
+
+    def test_concrete_fallback_is_only_specific_product_categories(self):
+        intent = bc.build_intent_spec(
+            "夏祭り", "夏祭りの「子連れ」対策グッズ", "夏祭り 子連れ",
+            [["nayami", "子連れ"]])
+        qs = bc.concrete_fallback_queries(intent, "夏祭り 子連れ")
+        self.assertIn("子供 迷子防止 タグ", qs)
+        self.assertNotIn("夏祭り", qs)
+
+    def test_direct_amazon_lanes_merge_without_resolving_each_item(self):
+        item_a = {"asin": "A", "itemInfo": {"title": {"displayValue": "軽量 電動ドライバー"}}}
+        item_b = {"asin": "B", "itemInfo": {"title": {"displayValue": "電動ドライバー 300g"}}}
+        conf = {"api_url": "https://example/searchItems", "partner_tag": "tag", "marketplace": "www.amazon.co.jp"}
+        with mock.patch.object(bc, "amazon_search", side_effect=[
+                {"searchResult": {"items": [item_a]}},
+                {"searchResult": {"items": [item_a, item_b]}},
+            ]), mock.patch.object(bc.time, "sleep"):
+            rows, tried, _ = bc.amazon_direct_candidates(conf, "token", "電動ドライバー 軽量")
+        self.assertEqual(2, len(tried))
+        self.assertEqual(2, len(rows))
+        merged = next(r for r in rows if r["amazon"]["asin"] == "A")
+        self.assertEqual({"relevance", "reviews"}, set(merged["candidate"]["amazon_lanes"]))
+
+    def test_cached_reason_keeps_type_out_of_visible_reason(self):
+        packed = bc._encode_cached_reason("切り口に合致", "携帯ポンプ")
+        self.assertEqual(("切り口に合致", "携帯ポンプ"), bc._decode_cached_reason(packed))
 
     def test_same_search_kw_different_angles_have_different_cache_keys(self):
         a = bc.build_intent_spec(
@@ -140,6 +199,41 @@ class IntentTransportTest(unittest.TestCase):
         self.assertIn("初心者の「パンク」に応える自転車", cmd)
         encoded = cmd[cmd.index("--components-json") + 1]
         self.assertEqual(components, json.loads(encoded))
+
+
+class SaveQualityTest(unittest.TestCase):
+    def test_one_or_two_items_do_not_replace_existing_result(self):
+        rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90}]
+        ok, reason = product_fetch.validate_new_result(rows, rerank=True)
+        self.assertFalse(ok)
+        self.assertIn("2件", reason)
+
+    def test_three_high_confidence_items_can_be_saved(self):
+        rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90},
+                {"asin": "C", "ai_score": 80}]
+        self.assertTrue(product_fetch.validate_new_result(rows, rerank=True)[0])
+
+    def test_score_below_public_threshold_is_blocked(self):
+        rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90},
+                {"asin": "C", "ai_score": 69}]
+        self.assertFalse(product_fetch.validate_new_result(rows, rerank=True)[0])
+
+    def test_force_does_not_replace_a_larger_existing_pool(self):
+        pool = [{"asin": "A", "ai_score": 95, "title": "A"},
+                {"asin": "B", "ai_score": 90, "title": "B"},
+                {"asin": "C", "ai_score": 80, "title": "C"}]
+        rows = [{"asin": x["asin"], "ai_score": x["ai_score"]} for x in pool]
+        with mock.patch.object(product_fetch, "rpc", return_value=6) as rpc, \
+             mock.patch.object(product_fetch, "build_pool", return_value=pool), \
+             mock.patch.object(product_fetch, "to_rows", return_value=rows), \
+             mock.patch.object(product_fetch, "usage_load", return_value=0), \
+             mock.patch.object(product_fetch, "usage_bump"), \
+             mock.patch.object(product_fetch, "read_batch_token", return_value="token"):
+            result = product_fetch.fetch_and_save(
+                "token", "2026-07-21", "テーマ", "切り口", "検索語",
+                rerank=True, force=True, components=[])
+        self.assertEqual("empty", result)
+        self.assertEqual(1, rpc.call_count)
 
 
 if __name__ == "__main__":

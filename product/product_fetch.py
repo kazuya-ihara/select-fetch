@@ -43,6 +43,8 @@ SB_PUBLISHABLE = "sb_publishable_hbtP3WrNCJp0BUuBrDs4Ww_6x79K4uc"
 # ガード既定値（慎重運用。必要なら調整）
 DAILY_ANGLE_LIMIT = int(os.environ.get("DAILY_ANGLE_LIMIT", "40"))  # env で上書き可（公開先読みは300）
 SLEEP_BETWEEN_ANGLES = 1.0  # 切り口間のウェイト（秒）
+REL_MIN = 70                 # build_candidates.py の公開品質基準と合わせる
+MIN_SAVE_COUNT = 3          # 0〜2件は候補収集失敗とみなし、既存結果を保持
 
 
 def today_str():
@@ -186,20 +188,42 @@ def to_rows(pool):
     return rows
 
 
+def validate_new_result(rows, rerank):
+    """新結果が明らかに劣化している時は、DBへ渡す前に止める。
+
+    現行RPCは旧商品の詳細を返さないため、前回との完全比較ではなく、
+    「3件以上・全件AI70点以上・ASIN重複なし」を上書きの必須条件とする。
+    """
+    rows = list(rows or [])
+    if len(rows) < MIN_SAVE_COUNT:
+        return False, "適格品%d件（0〜2件は再試行対象）" % len(rows)
+    asins = [r.get("asin") for r in rows if r.get("asin")]
+    if len(asins) != len(set(asins)):
+        return False, "ASIN重複あり"
+    if rerank:
+        bad = [r for r in rows if r.get("ai_score") is None or r.get("ai_score") < REL_MIN]
+        if bad:
+            return False, "未採点またはAI%d点未満=%d件" % (REL_MIN, len(bad))
+    return True, ""
+
+
 # ---------- 1切り口を取得して保存 ----------
 def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force, components=None):
     label = "%s / %s" % (theme, angle or "(テーマ単位)")
-    # ピン留め判定
-    if not force:
-        try:
-            n = rpc("v2_product_has", {
-                "p_secret": token, "p_catalog_date": catalog_date,
-                "p_theme": theme, "p_angle_title": angle or ""})
-            if isinstance(n, int) and n > 0:
-                print("  ⏭ 既に保存済み(%d件)なのでスキップ: %s" % (n, label))
-                return "skip"
-        except Exception as e:
-            print("  has確認失敗（続行）:", e)
+    # ピン留め判定と、force時の劣化防止に同じ件数を使う。
+    # 既存件数を取得できない場合は、保存を止めずに従来どおり続行する。
+    existing_count = None
+    try:
+        existing_count = rpc("v2_product_has", {
+            "p_secret": token, "p_catalog_date": catalog_date,
+            "p_theme": theme, "p_angle_title": angle or ""})
+        if not isinstance(existing_count, int):
+            existing_count = None
+        elif not force and existing_count > 0:
+            print("  ⏭ 既に保存済み(%d件)なのでスキップ: %s" % (existing_count, label))
+            return "skip"
+    except Exception as e:
+        print("  has確認失敗（続行）:", e)
     # 日次上限
     used = usage_load()
     if used >= DAILY_ANGLE_LIMIT:
@@ -213,9 +237,16 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force, compone
     rows = to_rows(pool)
     if not rows:
         print("  × 有効なASINが0件。保存せず。"); return "empty"
-    # 防御的ガード：本番の--rerank経路では、未採点や閾値未満が1件でも混じれば保存しない。
-    if rerank and any(r.get("ai_score") is None or r.get("ai_score") < 45 for r in rows):
-        print("  ⚠ 品質ゲート違反（未採点/45未満）。保存せず既存データを保護: %s" % label)
+    quality_ok, quality_reason = validate_new_result(rows, rerank)
+    if not quality_ok:
+        print("  ⚠ 新結果の品質ゲート不通過（%s）。保存せず既存データを保護: %s"
+              % (quality_reason, label))
+        return "empty"
+    # 手動forceでも、既存より少ない候補で置き換えない。
+    # v2_product_hasは件数だけを返すため、スコア平均ではなく安全側の件数比較を行う。
+    if force and existing_count is not None and existing_count > len(rows):
+        print("  ⚠ 既存%d件より新結果が少ない(%d件)ため上書きせず保護: %s"
+              % (existing_count, len(rows), label))
         return "empty"
     usage_bump()
     # 安全ガード：AIリランクを頼んだのに全件スコア無し＝Gemini無料枠切れ/失敗。

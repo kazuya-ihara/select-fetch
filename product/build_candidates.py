@@ -32,12 +32,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SHOP = os.path.join(HERE, "shopping_api.json")
 AMZ = os.path.join(HERE, "amazon_creators.json")
 
-# 表示件数の上限。足りない時も不適合商品では埋めない。
-TARGET_MAX = 9
+# 表示件数の上限。カードを3列×2段で見せられる6件を上限とし、
+# 足りない時も不適合商品では埋めない。
+TARGET_MAX = 6
 # AI関連性の表示下限。中間点は「近いが主用途が別」の商品も含み得るため、
 # 明確に適合した70点以上だけを表示する。これ未満は件数に関係なく表示しない。
 REL_MIN = 70
-# 検索で集める生候補の下限。除外・Amazon照合で落ちる分を見込んで上限の3倍を確保する。
+# 検索で集める生候補の下限。除外・AI判定で落ちる分を見込む。
 POOL_MIN = TARGET_MAX * 3
 # 1ブランドの最大表示数。同ブランドの超過分で空きを埋めない。
 MAX_PER_BRAND = 2
@@ -46,6 +47,13 @@ MAX_PER_BRAND = 2
 #     レビュー数で並べ替えず gather 順のまま上位を残す＝本命(鍵/シート等)を維持しつつ高速化。
 AMAZON_RESOLVE_MAX = 14
 
+# 90点版: Amazonを関連性順と評価順の2系統で直接検索する。
+# 通常は2呼び出しだけ。候補が極端に少ない時だけ別クエリを1回追加する。
+AMAZON_LANE_COUNT = 8
+AMAZON_DIRECT_MIN = 10
+AI_RERANK_MAX = 18
+MAX_PER_PRODUCT_TYPE = 2
+
 # ---- レート配慮（無料枠を超えないための最小限のウェイト）----
 SLEEP_BETWEEN_AMAZON = 0.6   # Amazon searchItems 連打の間隔（秒）
 
@@ -53,20 +61,17 @@ SLEEP_BETWEEN_AMAZON = 0.6   # Amazon searchItems 連打の間隔（秒）
 # ============================================================
 # 0. 除外辞書（叩き台。KAZUYAさんが後で修正する前提）
 # ============================================================
-# (a) セット/まとめ買い/複数個 → 単品優先で除外
+# (a) 業務用ロット/まとめ買い → 個人が1SKUを買える商品を優先
+# 「科学実験セット」「浴衣3点セット」のような機能的に1商品のセットは除外しない。
 SET_PATTERNS = [
-    r"セット", r"まとめ買い", r"まとめ売り", r"詰め合わせ", r"詰合せ",
+    r"まとめ買い", r"まとめ売り", r"業務用ロット", r"ケース販売",
     # 「100枚 うちわ」「10本組」など、入/セットの語が省略された業務用数量も除外。
     r"[0-9０-９]{2,}\s*(?:個|本|枚|袋|箱|パック)(?:入|入り|セット|組|パック)?",
-    r"[2-9２-９]\s*(?:個|本|枚|袋|箱|パック)(?:入|入り|セット|組|パック)",
-    r"[0-9０-９]+\s*個(?:入|セット|組|パック|袋|本|枚|箱)",
     r"[0-9０-９]+\s*(?:個|本|枚|袋|箱|パック|セット|組)入",
-    r"[0-9０-９]+\s*点(?:入り?|セット|組|パック)",   # 「2点入り」等の複数個パック
     # 「×N」はサイズ表記(35×50cm等)と衝突するため、数量単位が続く時だけ複数個とみなす
     r"×\s*[0-9０-９]+\s*(?:個|本|枚|袋|箱|パック|セット|組|set|pcs)",
-    r"x\s*[0-9]+\s*(?:個|本|set|pack)",
-    r"[0-9０-９]+pcs", r"[0-9０-９]+点セット",
-    r"福袋", r"アソート",
+    r"x\s*[0-9]{2,}\s*(?:個|本|set|pack)",
+    r"[0-9０-９]{2,}pcs",
 ]
 
 # (d) 効果効能に依存するカテゴリ（テーマ生成段階で除外の商品側 backstop）
@@ -511,7 +516,7 @@ def clean_query(name, brand):
     return head.strip()
 
 
-def amazon_search(c, token, keywords, count=3):
+def amazon_search(c, token, keywords, count=3, sort_by=None, min_reviews_rating=None):
     url = c["api_url"].replace("getItems", "searchItems")
     payload = {
         "keywords": keywords,
@@ -522,6 +527,10 @@ def amazon_search(c, token, keywords, count=3):
         "partnerType": "Associates",
         "marketplace": c["marketplace"],
     }
+    if sort_by:
+        payload["sortBy"] = sort_by
+    if min_reviews_rating is not None:
+        payload["minReviewsRating"] = min_reviews_rating
     try:
         data = get_json(url, data=json.dumps(payload).encode(), headers={
             "Authorization": "Bearer " + token,
@@ -534,10 +543,220 @@ def amazon_search(c, token, keywords, count=3):
     return data
 
 
+def build_amazon_query(intent, search_kw):
+    """Amazon用に、検索kwと構造化された最重要軸を1本の短いクエリへまとめる。"""
+    parts = [x for x in (search_kw or "").split() if x]
+    grouped = {}
+    for kind, value in normalize_components((intent or {}).get("components")):
+        grouped.setdefault(kind, []).append(value)
+    # 悩み・買い軸を先に、対象・シーンは後に足す。同じ語は重複させない。
+    for kind in ("nayami", "buy", "attr", "scene"):
+        for value in grouped.get(kind) or []:
+            value = str(value).strip()
+            if value and not any(value in p or p in value for p in parts):
+                parts.append(value)
+    return " ".join(parts[:6]).strip()
+
+
+def concrete_fallback_queries(intent, search_kw):
+    """不足時にだけ使う、無料の決め打ち商品カテゴリ検索。
+
+    抽象的な切り口（子連れ、軽い、映える等）は、そのままAmazonに投げると
+    商品カテゴリへ翻訳されないことがある。Gemini展開が使えない/空振りの時だけ、
+    少数の安全なカテゴリ語を候補にする。通常経路のAPI呼び出し数は増えない。
+    """
+    spec = intent or {}
+    components = normalize_components(spec.get("components"))
+    values = [norm(v) for _, v in components]
+    text = norm(" ".join([
+        spec.get("theme") or "", spec.get("angle_title") or "", search_kw or "",
+        " ".join(values),
+    ]))
+    out = []
+
+    def add(q):
+        q = (q or "").strip()
+        if q and q not in out:
+            out.append(q)
+
+    # 具体商品名が切り口に含まれる場合は代用品を混ぜず、その商品種だけ救済する。
+    if "うちわ" in text or "団扇" in text:
+        add("竹 うちわ 日本製 1本")
+        add("祭り うちわ 単品")
+    if "子連れ" in text or "子供" in text or "こども" in text:
+        add("子供 迷子防止 タグ")
+        add("子供 冷感タオル 夏")
+        add("子供 虫よけ 夏")
+    if "パンク" in text:
+        add("自転車 パンク修理キット")
+        add("ロードバイク 携帯ポンプ")
+        add("自転車 タイヤレバー")
+    if "軽い" in text or "軽量" in text:
+        if "電動ドライバー" in text or "電動ドリル" in text:
+            add("軽量 電動ドライバー")
+        elif "キャンプ" in text:
+            add("ソロキャンプ 軽量 クッカー")
+            add("ソロキャンプ 軽量 チェア")
+    if "高さ" in text and "枕" in text:
+        add("枕 高さ調整")
+        add("枕 高め 低め")
+    if "ひんやり" in text or "冷感" in text:
+        if "ペット" in text or "犬" in text or "猫" in text:
+            add("ペット 冷感マット")
+            add("犬 ひんやり ベッド")
+    if "すき間" in text or "すきま" in text or "隙間" in text:
+        if "風呂" in text or "浴室" in text:
+            add("風呂 隙間 掃除ブラシ")
+            add("浴室 目地 掃除ブラシ")
+    return out[:4]
+
+
+def _amazon_lane(c, token, query, lane="relevance", count=AMAZON_LANE_COUNT):
+    """Amazonの1検索系統を、解決済み候補rowとして返す。"""
+    review_lane = lane == "reviews"
+    res = amazon_search(
+        c, token, query, count=count,
+        sort_by="AvgCustomerReviews" if review_lane else None,
+        min_reviews_rating=4 if review_lane else None)
+    if not isinstance(res, dict):
+        return [], [], "invalid Amazon response"
+    if "_err" in res:
+        return [], [], res["_err"]
+    items = dig(res, "searchResult", "items") or dig(res, "items") or []
+    rows, dropped = [], []
+    for rank, item in enumerate(items, 1):
+        amz = parse_amazon_item(item, c["partner_tag"])
+        if not amz.get("asin") or not amz.get("title"):
+            continue
+        excl = classify_exclusion({"name": amz.get("title"), "source": "amazon"})
+        if excl and excl[0] == "drop":
+            dropped.append((amz.get("title") or "", excl[1]))
+            continue
+        candidate = {
+            "source": "amazon",
+            "name": amz.get("title") or "",
+            "price": amz.get("price"),
+            "review_count": None,  # Creators APIは正確な件数を返さない
+            "review_avg": None,
+            "brand": amz.get("brand") or "",
+            "jan": None,
+            "_search_query": query,
+            "amazon_lanes": [lane],
+            "%s_rank" % lane: rank,
+        }
+        rows.append({
+            "candidate": candidate,
+            "amazon": amz,
+            "verdict": "採用",
+            "reason": "Amazon Creators APIの直接検索",
+            "weak_flag": None,
+            "sources": ["amazon"],
+            "consensus": 1,
+        })
+    return rows, dropped, None
+
+
+def merge_amazon_rows(groups):
+    """ASINを主キーに、関連性順・評価順・救済検索の候補を統合する。"""
+    merged = {}
+    for rows in groups or []:
+        for row in rows or []:
+            asin = row.get("amazon", {}).get("asin")
+            if not asin:
+                continue
+            current = merged.get(asin)
+            if current is None:
+                current = row
+                current["candidate"]["amazon_lanes"] = list(
+                    current["candidate"].get("amazon_lanes") or [])
+                merged[asin] = current
+                continue
+            cand = current["candidate"]
+            incoming = row["candidate"]
+            for lane in incoming.get("amazon_lanes") or []:
+                if lane not in cand["amazon_lanes"]:
+                    cand["amazon_lanes"].append(lane)
+                key = "%s_rank" % lane
+                if incoming.get(key) is not None:
+                    cand[key] = min(cand.get(key, 999), incoming[key])
+
+    for row in merged.values():
+        lanes = set(row["candidate"].get("amazon_lanes") or [])
+        row["consensus"] = len(lanes)
+        row["sources"] = ["amazon"]
+    return list(merged.values())
+
+
+def amazon_direct_candidates(c, token, primary_query, fallback_queries=None):
+    """90点版の候補収集。通常はAmazon 2呼び出し、薄い時だけ1回追加する。"""
+    groups, tried, dropped = [], [], []
+    for lane in ("relevance", "reviews"):
+        rows, lane_dropped, err = _amazon_lane(c, token, primary_query, lane=lane)
+        groups.append(rows); dropped += lane_dropped
+        tried.append({"query": primary_query, "lane": lane, "count": len(rows), "error": err})
+        time.sleep(SLEEP_BETWEEN_AMAZON)
+    merged = merge_amazon_rows(groups)
+
+    # 0件や業務用ロットだらけの時だけ、AI展開の具体商品クエリで救済。
+    need_fallback = len(merged) < AMAZON_DIRECT_MIN or len(dropped) >= 4
+    if need_fallback:
+        base = _norm_key(primary_query)
+        for query in fallback_queries or []:
+            query = (query or "").strip()
+            if not query or _norm_key(query) == base:
+                continue
+            rows, lane_dropped, err = _amazon_lane(c, token, query, lane="fallback")
+            groups.append(rows); dropped += lane_dropped
+            tried.append({"query": query, "lane": "fallback", "count": len(rows), "error": err})
+            time.sleep(SLEEP_BETWEEN_AMAZON)
+            break
+        merged = merge_amazon_rows(groups)
+    return merged, tried, dropped
+
+
+def select_rerank_candidates(items, limit=AI_RERANK_MAX, max_per_brand=3):
+    """AIに渡す候補を、関連性順と評価順から交互に選ぶ。
+
+    Gemini呼び出し数は1回のまま、入力トークンとSEOブランド独占を抑える。
+    """
+    lanes = []
+    for lane in ("relevance", "reviews", "fallback"):
+        key = "%s_rank" % lane
+        lane_rows = sorted(
+            [r for r in items or [] if r.get("candidate", {}).get(key) is not None],
+            key=lambda r: r["candidate"][key])
+        lanes.append(lane_rows)
+    picked, seen, brands = [], set(), {}
+    while len(picked) < limit:
+        progressed = False
+        for rows in lanes:
+            while rows:
+                row = rows.pop(0)
+                asin = row.get("amazon", {}).get("asin")
+                if not asin or asin in seen:
+                    continue
+                brand = _norm_brand(row.get("amazon", {}).get("brand"))
+                if brand and brands.get(brand, 0) >= max_per_brand:
+                    continue
+                picked.append(row); seen.add(asin)
+                if brand:
+                    brands[brand] = brands.get(brand, 0) + 1
+                progressed = True
+                break
+            if len(picked) >= limit:
+                break
+        if not progressed:
+            break
+    return picked
+
+
 def amazon_direct_asins(c, token, kw, count=8):
     """Amazonを独立ソースとして、切り口キーワードで直接検索したASIN集合。
        楽天/Yahoo経由の解決ASINとの一致＝多源コンセンサスの1票になる。"""
     res = amazon_search(c, token, kw, count=count)
+    if not isinstance(res, dict):
+        print("    Amazon直接検索エラー: invalid Amazon response")
+        return set()
     if "_err" in res:
         print("    Amazon直接検索エラー:", res["_err"])
         return set()
@@ -836,7 +1055,8 @@ def _cache_score_get(intent_key, few_shot, asins):
     if isinstance(r, list):
         for row in r:
             if isinstance(row, dict) and row.get("asin"):
-                out[row["asin"]] = (row.get("score"), row.get("reason") or "")
+                reason, product_type = _decode_cached_reason(row.get("reason") or "")
+                out[row["asin"]] = (row.get("score"), reason, product_type)
     return out
 
 
@@ -844,6 +1064,23 @@ def _cache_score_put(intent_key, few_shot, items):
     if items:
         _sb_rpc("v2_ai_score_put", {"p_angle_key": _skey(intent_key, few_shot),
                                     "p_items": items, "p_model": "gemini"})
+
+
+_TYPE_CACHE_RE = re.compile(r"^\[\[type:(.{1,40}?)\]\]\s*")
+
+
+def _encode_cached_reason(reason, product_type):
+    """DBスキーマを増やさず、商品タイプを既存reasonキャッシュに保存する。"""
+    product_type = re.sub(r"[\[\]\r\n]", "", str(product_type or "")).strip()[:40]
+    return ("[[type:%s]] " % product_type if product_type else "") + (reason or "")
+
+
+def _decode_cached_reason(value):
+    value = str(value or "")
+    m = _TYPE_CACHE_RE.match(value)
+    if not m:
+        return value, ""
+    return value[m.end():], m.group(1).strip()
 
 
 def _local_used():
@@ -1105,8 +1342,13 @@ def gemini_expand_queries(conf, intent_text, intent_key):
 
 
 def _rerank_sort(pool):
-    """並べ替え：AI関連性を主役にし、照合確度(verdict)は同点調整にだけ使う。"""
+    """並べ替え：AI関連性→Amazon評価順レーン→照合確度。"""
+    def review_rank(row):
+        value = row.get("candidate", {}).get("reviews_rank")
+        return int(value) if value is not None else 999
     pool.sort(key=lambda r: (-(r.get("ai_score") if r.get("ai_score") is not None else -1),
+                             review_rank(r) == 999,
+                             review_rank(r),
                              VERDICT_ORDER[r["verdict"]],
                              -learn_score(r["amazon"].get("brand")),
                              -r["consensus"],
@@ -1115,17 +1357,24 @@ def _rerank_sort(pool):
 
 _WEIGHT_EVIDENCE_RE = re.compile(
     r"軽量|超軽量|軽い|重量|重さ|[0-9０-９]+(?:[\.,．][0-9０-９]+)?\s*(?:kg|g|キログラム|グラム)", re.I)
+_HEIGHT_EVIDENCE_RE = re.compile(r"高さ|高め|低め|低さ|高低|段階調整|[0-9０-９]+(?:\.[0-9０-９]+)?\s*(?:cm|mm|㎝)", re.I)
+_GAP_EVIDENCE_RE = re.compile(r"すき間|すきま|隙間|目地|溝|コーナー|角|細部|細い|スリム", re.I)
+_COOL_EVIDENCE_RE = re.compile(r"ひんやり|冷感|涼感|接触冷感|冷却|クール|pcm|ジェル", re.I)
 
 
 def apply_axis_evidence(items, components=None):
     """AIのソフト採点に、明示できる買い軸だけ決定的な証拠ゲートを重ねる。
 
     全軸を単純な文字一致にすると誤除外が増えるため、現時点では証拠を安全に判定できる
-    軽量軸と、具体商品名である「うちわ」だけを対象にする。
+    影テストで証拠を安全に判定できた軽量・高さ・すき間・冷感と、
+    具体商品名である「うちわ」を対象にする。
     """
     axes = [norm(value) for kind, value in normalize_components(components) if kind == "buy"]
     need_weight = any(axis in ("軽い", "軽量") for axis in axes)
     need_uchiwa = "うちわ" in axes
+    need_height = "高さ" in axes
+    need_gap = any(axis in ("すき間", "すきま", "隙間") for axis in axes)
+    need_cool = any(axis in ("ひんやり", "冷感", "涼しい") for axis in axes)
     for row in items or []:
         amz = row.get("amazon") or {}
         text = norm(" ".join([amz.get("title") or ""] + [str(x) for x in (amz.get("features") or [])]))
@@ -1134,11 +1383,63 @@ def apply_axis_evidence(items, components=None):
             failures.append("買い軸『軽い』の重量・軽量根拠なし")
         if need_uchiwa and not ("うちわ" in text or "団扇" in text):
             failures.append("商品種『うちわ』ではない")
+        if need_height and not _HEIGHT_EVIDENCE_RE.search(text):
+            failures.append("買い軸『高さ』の明示なし")
+        if need_gap and not _GAP_EVIDENCE_RE.search(text):
+            failures.append("買い軸『すき間』の形状・用途根拠なし")
+        if need_cool and not _COOL_EVIDENCE_RE.search(text):
+            failures.append("買い軸『ひんやり』の冷感根拠なし")
         if failures and row.get("ai_score") is not None:
             row["ai_score"] = min(row["ai_score"], 30)
             suffix = " / ".join(failures)
             row["ai_reason"] = (row.get("ai_reason") or "") + (" / " if row.get("ai_reason") else "") + suffix
     return items
+
+
+_PRODUCT_TYPE_PATTERNS = [
+    ("うちわ", r"うちわ|団扇"), ("浴衣", r"浴衣"), ("帯・着付け小物", r"帯|帯板|着付け"),
+    ("枕", r"枕|ピロー"), ("冷感マット", r"マット|冷却シート|冷感シート"),
+    ("ペットベッド", r"ペットベッド|ドーム|ハウス"), ("冷感ブランケット", r"ブランケット|毛布"),
+    ("電動ドライバー", r"電動ドライバ|電動ドリル"), ("修理キット", r"パンク修理|リペアキット|パッチ"),
+    ("携帯ポンプ", r"空気入れ|携帯ポンプ|ミニポンプ"), ("タイヤレバー", r"タイヤレバー"),
+    ("チューブレスプラグ", r"チューブレス|プラグ"), ("予備チューブ", r"チューブ"),
+    ("キャンプテーブル", r"テーブル|ロールテーブル"), ("キャンプチェア", r"チェア|イス"),
+    ("調理器具", r"クッカー|鍋|フライパン|メスティン"), ("バーナー", r"バーナー|ストーブ|コンロ"),
+    ("タープ", r"タープ"), ("ペグハンマー", r"ハンマー"),
+    ("風鈴キット", r"風鈴"), ("ランプキット", r"ランプ|ライト"), ("時計キット", r"時計"),
+    ("標本・レジン", r"標本|レジン"), ("科学実験キット", r"科学実験|実験キット"),
+    ("掃除ブラシ", r"ブラシ|ブラシセット"), ("スクレーパー", r"スクレーパー|ヘラ"),
+]
+
+
+def infer_product_type(row):
+    """AIが返した短い商品種を優先し、古いキャッシュはタイトルから補う。"""
+    explicit = str(row.get("product_type") or "").strip()
+    if explicit:
+        return _norm_key(explicit)[:40]
+    amz = row.get("amazon") or {}
+    text = norm(" ".join([amz.get("title") or ""] + [str(x) for x in (amz.get("features") or [])[:2]]))
+    for label, pattern in _PRODUCT_TYPE_PATTERNS:
+        if re.search(pattern, text, re.I):
+            return label
+    return "その他"
+
+
+def diversify_product_types(items, max_per=MAX_PER_PRODUCT_TYPE):
+    """商品種を分散する。同じ既知商品種は最大 max_per 件までにする。
+
+    商品種を判定できない「その他」は、誤判定による過剰な空洞化を避けるため上限を設けない。
+    既知商品種の超過分を後から戻すことはしない（件数合わせで多様性を無効化しない）。
+    """
+    picked, counts = [], {}
+    for row in items or []:
+        key = infer_product_type(row)
+        row["product_type"] = key
+        if key != "その他" and counts.get(key, 0) >= max_per:
+            continue
+        picked.append(row)
+        counts[key] = counts.get(key, 0) + 1
+    return picked
 
 
 def select_final_pool(items, require_ai=True, rel_min=REL_MIN,
@@ -1155,6 +1456,7 @@ def select_final_pool(items, require_ai=True, rel_min=REL_MIN,
     _rerank_sort(pool)
     pool = gender_consistency(pool)
     pool = diversify_brands(pool, max_per=max_per_brand)
+    pool = diversify_product_types(pool)
     return pool[:target_max]
 
 
@@ -1169,9 +1471,10 @@ def gemini_rerank(conf, intent_text, intent_key, pool, few_shot=None):
     for r in pool:
         a = r["amazon"].get("asin")
         if a and a in cached:
-            r["ai_score"], r["ai_reason"] = cached[a]
+            r["ai_score"], r["ai_reason"], r["product_type"] = cached[a]
         else:
             r["ai_score"], r["ai_reason"] = None, ""
+            r["product_type"] = ""
             todo.append(r)
     # 2) 全件キャッシュ命中ならGeminiを呼ばず確定
     if not todo:
@@ -1218,7 +1521,10 @@ def gemini_rerank(conf, intent_text, intent_key, pool, few_shot=None):
         "  - カテゴリは同じでも切り口の用途に合わない形状/仕様（例：『運動/通勤で外れない』なら、"
         "コードが邪魔で外れやすい“有線”や、固定力の弱い開放型は低評価。『高音質でじっくり』なら逆に許容）。\n"
         "ブランドの信頼性・不自然な煽り/粗悪さも加味し、価格の高安だけで過度に上下させないこと。\n"
-        "出力は必ずJSON配列のみ: [{\"i\":番号,\"score\":整数,\"reason\":\"20字程度の理由\"}]\n\n"
+        "product_typeは多様性判定用の短い一般名にする（例: 風鈴キット/月ランプ/携帯ポンプ）。"
+        "ブランド名・色・サイズは含めない。\n"
+        "出力は必ずJSON配列のみ: "
+        "[{\"i\":番号,\"score\":整数,\"reason\":\"20字程度の理由\",\"product_type\":\"短い一般名\"}]\n\n"
         "切り口の構造化情報:\n" + intent_text + fewshot_txt + "\n\n商品一覧:\n" + "\n".join(lines))
 
     url = ("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
@@ -1264,9 +1570,14 @@ def gemini_rerank(conf, intent_text, intent_key, pool, few_shot=None):
         s = by_i.get(i, {})
         r["ai_score"] = s.get("score")
         r["ai_reason"] = s.get("reason", "")
+        r["product_type"] = s.get("product_type", "")
         a = r["amazon"].get("asin")
         if a and r["ai_score"] is not None:
-            new_items.append({"asin": a, "score": r["ai_score"], "reason": r["ai_reason"]})
+            new_items.append({
+                "asin": a,
+                "score": r["ai_score"],
+                "reason": _encode_cached_reason(r["ai_reason"], r.get("product_type")),
+            })
     _cache_score_put(intent_key, few_shot, new_items)   # 新規採点を資産に追加（次回以降0コスト）
     _rerank_sort(pool)
     print("    AIスコア: %d件キャッシュ + %d件新規採点" % (len(pool) - len(todo), len(todo)))
@@ -1297,14 +1608,13 @@ def main():
     intent = build_intent_spec(ns.theme, ns.intent, kw, components)
 
     load_learning()   # ⑤ learning.json があればブランド重み＋お手本を適用（無ければ通常動作）
-    app_id, access_key, cid = load_shop_conf()
     print("=" * 62)
     print("検索キーワード:", kw)
     print("選定する切り口:", intent["angle_title"])
     print("=" * 62)
 
-    # AIクエリ変換（--rerank時のみ・Gemini設定があれば）。切り口の概念語を具体的な商品語へ
-    #   翻訳し、gather の最優先クエリにする（例：自転車 盗難→自転車 鍵/U字ロック）。
+    # AIクエリ変換は既存キャッシュを優先。Amazonの通常2系統が薄い時だけ、
+    # ここで得た具体商品クエリを1本だけ救済検索に使う。
     gconf = load_gemini_conf() if want_rerank else None
     if want_rerank and not gconf:
         emit_empty(want_json, "AI設定が無いため、未採点候補は公開しません")
@@ -1314,120 +1624,49 @@ def main():
         if ai_queries:
             print("[0] AIクエリ変換 → " + " / ".join(ai_queries))
 
-    # --- 1. 候補取得（AI変換クエリを最優先に、足りなければテーマ/修飾語で補完）---
-    cands, tried = gather_candidates(app_id, access_key, cid, kw, extra_queries=(ai_queries or None))
-    print("\n[1] 候補取得: 計 %d件（試したクエリ: %s）"
-          % (len(cands), " / ".join(tried)))
-    if not cands:
-        emit_empty(want_json, "全クエリで候補0件（テーマ単独でも0）。ネットワーク/キーの可能性")
-
-    # --- 2. 除外 ---
-    kept, dropped, flags = [], [], {}
-    for cand in cands:
-        res = classify_exclusion(cand)
-        if res and res[0] == "drop":
-            dropped.append((cand, res[1]))
-        else:
-            if res and res[0] == "flag":
-                flags[id(cand)] = res[1]
-            kept.append(cand)
-    print("\n[2] 除外: %d件を除外 / %d件が通過" % (len(dropped), len(kept)))
-    for cand, why in dropped:
-        print("    ✗ [%s] %s … %s" % (cand["source"], cand["name"][:36], why))
-    if flags:
-        print("    （弱フラグ %d件：中華製ヒント。除外はしない）" % len(flags))
-
-    # Amazon照合は1件ずつAPIを叩くので上限を維持しつつ、クエリ×取得元へ枠を分散する。
-    # 先頭クエリやSEOの強いブランドが全枠を独占しないようにする。
-    if len(kept) > AMAZON_RESOLVE_MAX:
-        print("    照合を分散選抜した %d件 に制限（全 %d件中／速度確保）"
-              % (AMAZON_RESOLVE_MAX, len(kept)))
-    kept = select_resolve_candidates(kept)
-
-    # --- 3. Amazon解決 ---
+    # --- 1. Amazonを正式候補として2系統検索 ---
     c = amazon_conf()
     token = amazon_token(c)
-    direct_kw = ai_queries[0] if ai_queries else kw
-    amz_direct = amazon_direct_asins(c, token, direct_kw)
-    time.sleep(SLEEP_BETWEEN_AMAZON)
-    print("\n[3] Amazon解決: トークンOK。Amazon直接検索=%d ASIN（独立ソース）。%d件を searchItems で照会…"
-          % (len(amz_direct), len(kept)))
-    resolved = []
-    for cand in kept:
-        q = clean_query(cand["name"], cand.get("brand"))
-        res = amazon_search(c, token, q, count=2)
-        time.sleep(SLEEP_BETWEEN_AMAZON)
-        if "_err" in res:
-            print("    × [%s] %s → %s" % (cand["source"], cand["name"][:28], res["_err"]))
-            continue
-        items = dig(res, "searchResult", "items") or dig(res, "items") or []
-        if not items:
-            print("    ・ヒットなし: %s" % cand["name"][:34])
-            continue
-        amz = parse_amazon_item(items[0], c["partner_tag"])
-        # backstop: Amazonタイトル側にもセット/効果効能除外を適用（候補名が単品でもAmazonが束売りのことがある）
-        amz_excl = classify_exclusion({"name": amz.get("title"), "source": "amazon"})
-        if amz_excl and amz_excl[0] == "drop":
-            print("    ✗Amazon側除外: %s … %s"
-                  % ((amz.get("title") or "")[:30], amz_excl[1]))
-            continue
-        verdict, reason = match_gate(cand, amz)
-        resolved.append({
-            "candidate": cand,
-            "amazon": amz,
-            "verdict": verdict,
-            "reason": reason,
-            "weak_flag": flags.get(id(cand)),
-        })
-
+    primary_query = build_amazon_query(intent, kw) or kw
+    fallback_queries = (
+        list(ai_queries or [])
+        + concrete_fallback_queries(intent, kw)
+        + plan_queries(kw)
+    )
+    resolved, tried, dropped = amazon_direct_candidates(
+        c, token, primary_query, fallback_queries=fallback_queries)
+    print("\n[1] Amazon直接候補: %d件（クエリ=%s）" % (len(resolved), primary_query))
+    for log in tried:
+        suffix = " / ERROR=" + log["error"] if log.get("error") else ""
+        print("    %s: %s → %d件%s" % (log["lane"], log["query"], log["count"], suffix))
+    if dropped:
+        print("    業務用ロット・法務バックストップで %d件を除外" % len(dropped))
+        for title, why in dropped[:6]:
+            print("      ✗ %s … %s" % (title[:44], why))
     if not resolved:
-        emit_empty(want_json, "Amazon解決が0件（候補はあったがASIN化できず）")
+        emit_empty(want_json, "Amazonの関連性順・評価順・救済検索がすべて0件")
 
-    # --- 4. 照合ゲート結果 ---
-    print("\n[4] 照合ゲート:")
-    for r in resolved:
-        amz = r["amazon"]
-        mark = {"採用": "◎", "要確認": "△", "保留": "▽"}[r["verdict"]]
-        print("    %s %s | ASIN=%s | %s"
-              % (mark, r["verdict"], amz.get("asin"), (amz.get("title") or "")[:34]))
-        print("        候補[%s]=%s" % (r["candidate"]["source"], r["candidate"]["name"][:40]))
-        print("        理由=%s%s"
-              % (r["reason"], "  ⚠%s" % r["weak_flag"] if r["weak_flag"] else ""))
-
-    # --- 5. 重複排除＋多源コンセンサス（同一ASINに何ソースが一致したか）---
-    best, src_by_key = {}, {}
+    # --- 2. AI投入前にレーン分散・ブランド偏り・重複を圧縮 ---
+    resolved = select_rerank_candidates(resolved)
+    best = {}
     for r in resolved:
         k = dedup_key(r)
-        src_by_key.setdefault(k, set()).add(r["candidate"]["source"])  # rakuten / yahoo
-        cur = best.get(k)
-        if cur is None or VERDICT_ORDER[r["verdict"]] < VERDICT_ORDER[cur["verdict"]]:
+        if k not in best:
             best[k] = r
-    for k, r in best.items():
-        src = set(src_by_key[k])
-        if r["amazon"].get("asin") in amz_direct:                      # Amazon直接検索の一致
-            src.add("amazon")
-        r["sources"] = sorted(src)
-        r["consensus"] = len(src)
     uniq = list(best.values())
-    # AI採点前の仮並び：照合確度 → 学習重み → コンセンサス → レビュー
-    uniq.sort(key=lambda r: (VERDICT_ORDER[r["verdict"]],
-                             -learn_score(r["amazon"].get("brand")),
-                             -r["consensus"],
-                             -(r["candidate"].get("review_count") or 0)))
-    # 同ブランドの色/サイズ/個数違い・重複出品を畳む（上位を残す）。ASINが違っても実質同一品を1つに。
     _before_var = len(uniq)
     uniq = collapse_variants(uniq)
     if _before_var != len(uniq):
         print("    同ブランドの重複/色サイズ違いを %d件 畳み込み" % (_before_var - len(uniq)))
     multi = sum(1 for r in uniq if r["consensus"] >= 2)
-    print("\n[5] 重複排除＋多源コンセンサス: %d件 → %d件（うち複数ソース一致=%d件）"
+    print("\n[2] AI投入候補: %d件 → %d件（関連性順+評価順の両方に出現=%d件）"
           % (len(resolved), len(uniq), multi))
     if LEARN:
         _bw = LEARN.get("brand_weight") or {}
         _fs = LEARN.get("few_shot") or []
         print("    学習を適用：ブランド重み%d件・お手本%d件（承認/👍👎から）" % (len(_bw), len(_fs)))
 
-    # --- 6.（先に）AIリランク＋関連性フィルタ：切り口に用途が合わない商品を落とす ---
+    # --- 3. AIリランク＋関連性フィルタ：切り口に用途が合わない商品を落とす ---
     #     ※最終件数を決める前に全候補(uniq)を採点し、スコアが低い（＝
     #       切り口の用途に合わない。例: 「おむつ」でヒットしたおむつゴミ箱/犬用おむつ）
     #       を除外してから選ぶ。これにより先読みでも用途違いが並ばない。
@@ -1435,14 +1674,14 @@ def main():
     if want_rerank:
         # gconf は main 冒頭でロード済み（AIクエリ変換と共用）。二重ロードしない。
         if gconf:
-            print("\n[6] AIリランク（Gemini %s）で切り口適合度を採点し用途不一致を除外…" % gconf["model"])
+            print("\n[3] AIリランク（Gemini %s）で切り口適合度を採点し用途不一致を除外…" % gconf["model"])
             _few = (LEARN.get("few_shot") if LEARN else None) or None
             uniq, reranked = gemini_rerank(
                 gconf, intent["intent_text"], intent["intent_key"], uniq, few_shot=_few)
             if not reranked:
                 emit_empty(want_json, "AI採点が未完了。未採点候補は公開しません")
 
-    # --- 7. 適格候補だけから最大9件を選ぶ。除外候補・同ブランド超過分は復活させない。 ---
+    # --- 4. 適格候補だけから最大6件を選ぶ。除外候補・同ブランド超過分は復活させない。 ---
     before_relevance = len(uniq)
     pool = select_final_pool(uniq, require_ai=want_rerank, components=intent["components"])
     if want_rerank:
@@ -1480,6 +1719,7 @@ def main():
             "verdict": r["verdict"], "reason": r["reason"],
             "consensus": r["consensus"], "sources": r["sources"],
             "ai_score": r.get("ai_score"), "ai_reason": r.get("ai_reason"),
+            "product_type": r.get("product_type"),
             "asin": r["amazon"].get("asin"),
             "parent_asin": r["amazon"].get("parent_asin"),
             "title": r["amazon"].get("title"),
@@ -1496,9 +1736,8 @@ def main():
         print(json.dumps(out, ensure_ascii=False, indent=2))
 
     print("\n==== 見方 ====")
-    print("◎採用=ブランド/JAN一致で確度高い / △要確認=型番やブランド語の弱一致 / ▽保留=一致なし。")
-    print("N源一致=同一ASINに何ソース(楽天/Yahoo/Amazon)が一致したか。多いほど信頼できる。")
-    print("並び順=AI適合→照合確度→学習重み→コンセンサス→レビュー。AI%d未満は表示しない。"
+    print("正式候補=Amazon Creators APIの直接検索。評価順レーンは星4以上指定。")
+    print("並び順=AI適合→Amazon評価順レーン→学習重み→多様性。AI%d未満は表示しない。"
           % REL_MIN)
 
 
