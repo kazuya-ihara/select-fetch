@@ -5,6 +5,15 @@ name: 商品バッチ（対応済み切り口を取得）
 # 定期実行したい場合は schedule のコメントを外す（cronはUTC）。
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "影テスト（保存なし）か、合格候補の正式反映か"
+        required: true
+        default: shadow
+        type: choice
+        options:
+          - shadow
+          - promote
   schedule:
     - cron: "*/30 * * * *"   # 30分おきに自動実行（対応済み切り口を取得。手動ボタンも残す）
 
@@ -68,7 +77,14 @@ jobs:
         run: python3 product/learn.py
 
       - name: 対応済み切り口の商品を取得（→ v2_product）
-        run: python3 product/fetch_claimed.py --rerank --limit 40
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.mode }}" = "promote" ]; then
+            python3 product/fetch_claimed.py --rerank --limit 40 --promote-quality --confirm-promote
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python3 product/fetch_claimed.py --rerank --limit 40 --shadow
+          else
+            python3 product/fetch_claimed.py --rerank --limit 40
+          fi
 
       - name: 後片付け（鍵ファイルを消す）
         if: always()
