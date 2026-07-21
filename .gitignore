@@ -16,6 +16,7 @@ product/gemini_usage.json
 product/product_usage.json
 product/learning.json
 product/fetch_queue.json
+product/shadow_results.json
 product/採点シート.html
 **/__pycache__/
 .DS_Store

@@ -6,6 +6,7 @@ import os
 import sys
 import types
 import unittest
+import tempfile
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +203,37 @@ class IntentTransportTest(unittest.TestCase):
 
 
 class SaveQualityTest(unittest.TestCase):
+    def test_shadow_snapshot_round_trip_is_keyed_by_catalog_and_angle(self):
+        item = {
+            "catalog_date": "2026-07-21",
+            "theme": "枕",
+            "angle": "買い替え向けの枕（高さで選ぶ）",
+            "kw": "枕 高さ",
+            "components": [["buy", "高さ"]],
+            "rows": [{"asin": "A", "ai_score": 95}],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "shadow_results.json")
+            fetch_claimed.write_shadow_snapshot(path, "2026-07-21", [item])
+            loaded = fetch_claimed.load_shadow_snapshot(path)
+        self.assertEqual(item["rows"], loaded[("2026-07-21", "枕", item["angle"])] ["rows"])
+
+    def test_snapshot_promotion_does_not_consume_daily_fetch_quota(self):
+        rows = [
+            {"asin": "A", "ai_score": 95},
+            {"asin": "B", "ai_score": 90},
+            {"asin": "C", "ai_score": 85},
+            {"asin": "D", "ai_score": 80},
+        ]
+        with mock.patch.object(product_fetch, "rpc", return_value=4) as rpc, \
+             mock.patch.object(product_fetch, "usage_bump") as bump:
+            result = product_fetch.persist_rows(
+                "token", "2026-07-21", "枕", "高さ", rows, rerank=True,
+                promote=True, existing_count=9, count_usage=False)
+        self.assertEqual("promoted", result)
+        bump.assert_not_called()
+        self.assertEqual(1, rpc.call_count)
+
     def test_one_or_two_items_do_not_replace_existing_result(self):
         rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90}]
         ok, reason = product_fetch.validate_new_result(rows, rerank=True)

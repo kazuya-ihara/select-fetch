@@ -242,9 +242,80 @@ def validate_quality_promotion(rows, existing_count, rerank):
     return True, "最低AI%d点・平均AI%.1f点" % (min_score, avg_score)
 
 
+def persist_rows(token, catalog_date, theme, angle, rows, rerank,
+                 force=False, promote=False, existing_count=None,
+                 count_usage=True):
+    """取得済みの行を品質確認して v2_product に保存する。
+
+    影テスト結果の再利用時は、検索・AI評価を行わずこの関数だけを呼ぶ。
+    count_usage=False にすると、過去の取得を正式反映するだけなので日次使用量を
+    増やさない。既存の通常取得と同じ品質ゲート・上書きガードを通す。
+    """
+    label = "%s / %s" % (theme, angle or "(テーマ単位)")
+    rows = list(rows or [])
+    if existing_count is None:
+        try:
+            existing_count = rpc("v2_product_has", {
+                "p_secret": token, "p_catalog_date": catalog_date,
+                "p_theme": theme, "p_angle_title": angle or ""})
+            if not isinstance(existing_count, int):
+                existing_count = None
+        except Exception as e:
+            print("  has確認失敗（保存を保留）:", type(e).__name__, e)
+            existing_count = None
+
+    quality_ok, quality_reason = validate_new_result(rows, rerank)
+    if not quality_ok:
+        print("  ⚠ 新結果の品質ゲート不通過（%s）。保存せず既存データを保護: %s"
+              % (quality_reason, label))
+        return "empty"
+    if promote:
+        promote_ok, promote_reason = validate_quality_promotion(rows, existing_count, rerank)
+        if not promote_ok:
+            print("  ⚠ 昇格条件不通過（%s）。旧データを保持: %s"
+                  % (promote_reason, label))
+            return "empty"
+        print("  ✅ 昇格条件を通過（%s）。旧結果を保存前に置き換えます: %s"
+              % (promote_reason, label))
+
+    # 手動forceでも、既存より少ない候補で置き換えない。
+    if force and not promote and existing_count is not None and existing_count > len(rows):
+        print("  ⚠ 既存%d件より新結果が少ない(%d件)ため上書きせず保護: %s"
+              % (existing_count, len(rows), label))
+        return "empty"
+
+    # 安全ガード：AIリランクを頼んだのに全件スコア無し＝Gemini無料枠切れ/失敗。
+    # その結果で既存の“AIフィルタ済み”データを上書きしない。
+    replace = bool(force or promote)
+    ai_ran = any(r.get("ai_score") is not None for r in rows)
+    if force and rerank and not ai_ran:
+        print("  ⚠ AIリランク不発（枠切れ?）。既存のAI済みデータ保護のため上書きしない: %s" % label)
+        replace = False
+    if count_usage:
+        usage_bump()
+    try:
+        res = rpc("v2_upsert_product", {
+            "p_secret": token, "p_catalog_date": catalog_date,
+            "p_theme": theme, "p_angle_title": angle or "",
+            "p_products": rows, "p_replace": replace})
+        if res == -1:
+            print("  ⏭ 既存あり・上書きせずスキップ: %s" % label)
+            return "skip"
+        print("  ✅ 保存 %s 件%s: %s"
+              % (res, "（品質昇格）" if promote else "", label))
+        return "promoted" if promote else "saved"
+    except urllib.error.HTTPError as e:
+        print("  保存失敗 HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:200]))
+        return "error"
+    except Exception as e:
+        print("  保存失敗: %s: %s" % (type(e).__name__, e))
+        return "error"
+
+
 # ---------- 1切り口を取得して保存 ----------
 def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
-                   components=None, shadow=False, promote=False):
+                   components=None, shadow=False, promote=False,
+                   shadow_capture=None):
     label = "%s / %s" % (theme, angle or "(テーマ単位)")
     # ピン留め判定と、force時の劣化防止に同じ件数を使う。
     # 既存件数を取得できない場合は、保存を止めずに従来どおり続行する。
@@ -287,49 +358,19 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
                   % (i, row.get("ai_score") if row.get("ai_score") is not None else "未採点",
                      row.get("brand") or "ブランド不明",
                      (row.get("title") or "商品名不明")[:90], row.get("asin")))
+        if shadow_capture is not None:
+            shadow_capture.append({
+                "catalog_date": catalog_date,
+                "theme": theme,
+                "angle": angle or "",
+                "kw": kw,
+                "components": components or [],
+                "rows": rows,
+            })
         return "shadow"
-    if not quality_ok:
-        print("  ⚠ 新結果の品質ゲート不通過（%s）。保存せず既存データを保護: %s"
-              % (quality_reason, label))
-        return "empty"
-    if promote:
-        promote_ok, promote_reason = validate_quality_promotion(rows, existing_count, rerank)
-        if not promote_ok:
-            print("  ⚠ 昇格条件不通過（%s）。旧データを保持: %s"
-                  % (promote_reason, label))
-            return "empty"
-        print("  ✅ 昇格条件を通過（%s）。旧結果を保存前に置き換えます: %s"
-              % (promote_reason, label))
-    # 手動forceでも、既存より少ない候補で置き換えない。
-    # v2_product_hasは件数だけを返すため、スコア平均ではなく安全側の件数比較を行う。
-    if force and not promote and existing_count is not None and existing_count > len(rows):
-        print("  ⚠ 既存%d件より新結果が少ない(%d件)ため上書きせず保護: %s"
-              % (existing_count, len(rows), label))
-        return "empty"
-    usage_bump()
-    # 安全ガード：AIリランクを頼んだのに全件スコア無し＝Gemini無料枠切れ/失敗。
-    # その結果で既存の“AIフィルタ済み”データを上書きすると関連性が落ちるので、
-    # force でも上書きを止める（既存があれば保持し、空の切り口だけ新規挿入）。
-    replace = bool(force or promote)
-    ai_ran = any(r.get("ai_score") is not None for r in rows)
-    if force and rerank and not ai_ran:
-        print("  ⚠ AIリランク不発（枠切れ?）。既存のAI済みデータ保護のため上書きしない: %s" % label)
-        replace = False
-    try:
-        res = rpc("v2_upsert_product", {
-            "p_secret": token, "p_catalog_date": catalog_date,
-            "p_theme": theme, "p_angle_title": angle or "",
-            "p_products": rows, "p_replace": replace})
-        if res == -1:
-            print("  ⏭ 既存あり・上書きせずスキップ: %s" % label); return "skip"
-        print("  ✅ 保存 %s 件%s: %s"
-              % (res, "（品質昇格）" if promote else "", label))
-        return "promoted" if promote else "saved"
-    except urllib.error.HTTPError as e:
-        print("  保存失敗 HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:200]))
-        return "error"
-    except Exception as e:
-        print("  保存失敗: %s: %s" % (type(e).__name__, e)); return "error"
+    return persist_rows(token, catalog_date, theme, angle, rows, rerank,
+                        force=force, promote=promote,
+                        existing_count=existing_count, count_usage=True)
 
 
 def main():
