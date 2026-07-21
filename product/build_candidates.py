@@ -1360,6 +1360,8 @@ _WEIGHT_EVIDENCE_RE = re.compile(
 _HEIGHT_EVIDENCE_RE = re.compile(r"高さ|高め|低め|低さ|高低|段階調整|[0-9０-９]+(?:\.[0-9０-９]+)?\s*(?:cm|mm|㎝)", re.I)
 _GAP_EVIDENCE_RE = re.compile(r"すき間|すきま|隙間|目地|溝|コーナー|角|細部|細い|スリム", re.I)
 _COOL_EVIDENCE_RE = re.compile(r"ひんやり|冷感|涼感|接触冷感|冷却|クール|pcm|ジェル", re.I)
+_PET_EVIDENCE_RE = re.compile(r"ペット|犬|猫|ドッグ|キャット|犬用|猫用", re.I)
+_HUMAN_ONLY_COOL_RE = re.compile(r"人用|大人用|子供用|こども用|ベビー用|人間用", re.I)
 
 
 def apply_axis_evidence(items, components=None):
@@ -1394,6 +1396,35 @@ def apply_axis_evidence(items, components=None):
             suffix = " / ".join(failures)
             row["ai_reason"] = (row.get("ai_reason") or "") + (" / " if row.get("ai_reason") else "") + suffix
     return items
+
+
+def apply_intent_category_evidence(items, theme="", angle_title=""):
+    """テーマ固有の明白な用途違いを、AI点数に関係なく除外する。
+
+    「ペット冷感グッズ」では、人用の氷枕が検索語に引っ張られて混ざりやすい。
+    ペット用途の語が商品情報に一つもなく、人用・子供用だけを示す商品は、
+    低スコア化ではなく最終候補から除外する。ペット用の明示がある商品は残し、
+    「人用・ペット用」の兼用品を誤って落としすぎない。
+    """
+    theme_text = norm(" ".join([theme or "", angle_title or ""]))
+    if "ペット" not in theme_text or not any(
+            word in theme_text for word in ("冷感", "ひんやり", "涼しい", "冷却")):
+        return list(items or [])
+    kept = []
+    for row in items or []:
+        amz = row.get("amazon") or {}
+        text = norm(" ".join([amz.get("title") or ""] +
+                             [str(x) for x in (amz.get("features") or [])]))
+        has_pet = bool(_PET_EVIDENCE_RE.search(text))
+        human_only = bool(_HUMAN_ONLY_COOL_RE.search(text)) and not has_pet
+        if human_only:
+            row["ai_score"] = 0
+            reason = "ペット用途の明示がなく、人用・子供用の冷感商品"
+            row["ai_reason"] = (row.get("ai_reason") or "") + (
+                " / " if row.get("ai_reason") else "") + reason
+            continue
+        kept.append(row)
+    return kept
 
 
 _PRODUCT_TYPE_PATTERNS = [
@@ -1443,7 +1474,8 @@ def diversify_product_types(items, max_per=MAX_PER_PRODUCT_TYPE):
 
 
 def select_final_pool(items, require_ai=True, rel_min=REL_MIN,
-                      target_max=TARGET_MAX, max_per_brand=MAX_PER_BRAND, components=None):
+                      target_max=TARGET_MAX, max_per_brand=MAX_PER_BRAND,
+                      components=None, theme="", angle_title=""):
     """適格候補だけから最大 target_max 件を選ぶ。
 
     rejectされた候補を件数合わせで復活させないことが、この関数の最重要契約。
@@ -1451,6 +1483,7 @@ def select_final_pool(items, require_ai=True, rel_min=REL_MIN,
     pool = list(items or [])
     if require_ai:
         apply_axis_evidence(pool, components)
+        pool = apply_intent_category_evidence(pool, theme=theme, angle_title=angle_title)
         pool = [r for r in pool
                 if r.get("ai_score") is not None and r.get("ai_score") >= rel_min]
     _rerank_sort(pool)
@@ -1683,7 +1716,13 @@ def main():
 
     # --- 4. 適格候補だけから最大6件を選ぶ。除外候補・同ブランド超過分は復活させない。 ---
     before_relevance = len(uniq)
-    pool = select_final_pool(uniq, require_ai=want_rerank, components=intent["components"])
+    pool = select_final_pool(
+        uniq,
+        require_ai=want_rerank,
+        components=intent["components"],
+        theme=intent["theme"],
+        angle_title=intent["angle_title"],
+    )
     if want_rerank:
         rejected = before_relevance - sum(
             1 for r in uniq if r.get("ai_score") is not None and r.get("ai_score") >= REL_MIN)

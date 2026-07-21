@@ -89,6 +89,21 @@ class SelectionPolicyTest(unittest.TestCase):
         out = bc.select_final_pool([fan, uchiwa], components=[["buy", "うちわ"]])
         self.assertEqual([uchiwa], out)
 
+    def test_pet_cooling_drops_human_only_cooling_items(self):
+        human = make_row(90, "A", title="アイス枕 人用 冷却マット", n=1)
+        pet = make_row(80, "B", title="犬用 ペット 冷感マット", n=2)
+        out = bc.select_final_pool(
+            [human, pet], theme="ペット冷感グッズ",
+            angle_title="夏の室内向けのペット冷感グッズ（ひんやりで選ぶ）")
+        self.assertEqual([pet], out)
+
+    def test_pet_cooling_keeps_explicit_multi_use_pet_item(self):
+        shared = make_row(80, "A", title="人用 ペット用 冷感マット", n=1)
+        out = bc.select_final_pool(
+            [shared], theme="ペット冷感グッズ",
+            angle_title="夏の室内向けのペット冷感グッズ（ひんやりで選ぶ）")
+        self.assertEqual([shared], out)
+
     def test_amazon_review_lane_breaks_ai_score_tie(self):
         relevance = make_row(90, "A", n=1)
         reviews = make_row(90, "B", n=2)
