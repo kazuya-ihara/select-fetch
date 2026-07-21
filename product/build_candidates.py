@@ -1413,9 +1413,9 @@ def apply_intent_category_evidence(items, theme="", angle_title=""):
     kept = []
     for row in items or []:
         amz = row.get("amazon") or {}
-        text = norm(" ".join([amz.get("title") or ""] +
-                             [str(x) for x in (amz.get("features") or [])]))
-        title = norm(amz.get("title") or "")
+        title = norm(amz.get("title") or row.get("title") or "")
+        features = amz.get("features") or row.get("features") or []
+        text = norm(" ".join([title] + [str(x) for x in features]))
         has_pet = bool(_PET_EVIDENCE_RE.search(text))
         title_has_pet = bool(_PET_EVIDENCE_RE.search(title))
         human_only = (
