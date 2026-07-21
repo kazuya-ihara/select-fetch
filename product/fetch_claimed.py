@@ -59,18 +59,22 @@ def main():
     ap.add_argument("--rerank", action="store_true")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--limit", type=int, default=40)
+    ap.add_argument("--shadow", action="store_true", help="保存せず新候補とAI評価だけを表示")
     args = ap.parse_args()
 
     # GitHubの手動実行は、誤操作で全切り口を一度に再取得しないよう安全側に制限する。
     # 定期実行(schedule)とMac実行には影響しない。必要なら環境変数で上限だけ調整できる。
     manual_run = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     run_limit = args.limit
-    run_force = args.force
+    # 手動実行は影テストを標準にする。確認前に本番表示を入れ替えないため。
+    run_shadow = args.shadow or manual_run
+    run_force = args.force and not run_shadow
     if manual_run:
         manual_cap = int(os.environ.get("MANUAL_TEST_LIMIT", "3"))
         run_limit = min(args.limit, max(1, manual_cap))
-        run_force = True
-        print("手動テストモード: 最大%d切り口・既存結果を比較して安全に更新" % run_limit)
+        print("手動テストモード: 最大%d切り口・保存せず新候補を確認" % run_limit)
+    elif args.shadow:
+        print("影テストモード: 保存せず新候補を確認")
 
     token = pf.read_batch_token()
     if not token:
@@ -115,7 +119,7 @@ def main():
         print("対応済みの切り口がありません（アプリで『対応する』を押すと対象になります）。")
         return
 
-    stats = {"saved": 0, "skip": 0, "empty": 0, "error": 0, "limit": 0, "nokw": 0}
+    stats = {"saved": 0, "shadow": 0, "skip": 0, "empty": 0, "error": 0, "limit": 0, "nokw": 0}
     done_fetch = 0
     for cdate, theme, angle, spec in targets:
         if done_fetch >= run_limit:
@@ -124,17 +128,19 @@ def main():
         if not kw:
             print("  × kw不明（カタログに該当切り口なし）: %s / %s" % (theme, angle)); stats["nokw"] += 1; continue
         r = pf.fetch_and_save(token, cdate, theme, angle, kw, args.rerank, run_force,
-                              components=(spec or {}).get("components") or [])
+                              components=(spec or {}).get("components") or [],
+                              shadow=run_shadow)
         stats[r] = stats.get(r, 0) + 1
         if r == "limit":
             break
-        if r == "saved":
+        if r in ("saved", "shadow"):
             done_fetch += 1
             time.sleep(pf.SLEEP_BETWEEN_ANGLES)
 
     print("\n" + "=" * 60)
-    print("完了: 保存%d / スキップ%d / 空%d / エラー%d / kw不明%d"
-          % (stats["saved"], stats["skip"], stats["empty"], stats["error"], stats["nokw"]))
+    print("完了: 保存%d / 影テスト%d / スキップ%d / 空%d / エラー%d / kw不明%d"
+          % (stats["saved"], stats["shadow"], stats["skip"], stats["empty"],
+             stats["error"], stats["nokw"]))
 
 
 if __name__ == "__main__":

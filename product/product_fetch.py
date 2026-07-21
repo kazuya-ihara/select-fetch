@@ -208,7 +208,8 @@ def validate_new_result(rows, rerank):
 
 
 # ---------- 1切り口を取得して保存 ----------
-def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force, components=None):
+def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
+                   components=None, shadow=False):
     label = "%s / %s" % (theme, angle or "(テーマ単位)")
     # ピン留め判定と、force時の劣化防止に同じ件数を使う。
     # 既存件数を取得できない場合は、保存を止めずに従来どおり続行する。
@@ -219,7 +220,7 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force, compone
             "p_theme": theme, "p_angle_title": angle or ""})
         if not isinstance(existing_count, int):
             existing_count = None
-        elif not force and existing_count > 0:
+        elif not force and not shadow and existing_count > 0:
             print("  ⏭ 既に保存済み(%d件)なのでスキップ: %s" % (existing_count, label))
             return "skip"
     except Exception as e:
@@ -238,6 +239,17 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force, compone
     if not rows:
         print("  × 有効なASINが0件。保存せず。"); return "empty"
     quality_ok, quality_reason = validate_new_result(rows, rerank)
+    if shadow:
+        print("  ◇ 影テスト: 新候補%d件 / 既存%s件（DBには保存しません）"
+              % (len(rows), existing_count if existing_count is not None else "不明"))
+        if not quality_ok:
+            print("  ◇ 品質ゲート判定: 保留（%s）" % quality_reason)
+        for i, row in enumerate(rows, 1):
+            print("    %d. AI=%s / %s / %s / ASIN=%s"
+                  % (i, row.get("ai_score") if row.get("ai_score") is not None else "未採点",
+                     row.get("brand") or "ブランド不明",
+                     (row.get("title") or "商品名不明")[:90], row.get("asin")))
+        return "shadow"
     if not quality_ok:
         print("  ⚠ 新結果の品質ゲート不通過（%s）。保存せず既存データを保護: %s"
               % (quality_reason, label))
@@ -283,6 +295,7 @@ def main():
                     help="catalog_date（既定=Supabaseの最新カタログ日／取れなければ今日）")
     ap.add_argument("--rerank", action="store_true", help="AIリランクも実行")
     ap.add_argument("--force", action="store_true", help="ピン留めを無視して入れ替え")
+    ap.add_argument("--shadow", action="store_true", help="保存せず新候補とAI評価だけを表示")
     args = ap.parse_args()
 
     token = read_batch_token()
