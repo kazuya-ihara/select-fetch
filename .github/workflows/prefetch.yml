@@ -25,6 +25,7 @@ jobs:
       TOP_THEMES: "80"
       MAX_ANGLES: "400"
       PER_THEME: "6"     # backed + gray救済 を各テーマ全部拾う（4だと溢れる）
+      QUALITY_REPORT_PATH: product/quality_events.jsonl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -78,7 +79,27 @@ jobs:
 
       - name: 先読み取得（→ v2_product。今日のcatalog_dateで保存）
         run: |
+          rm -f product/quality_events.jsonl product/quality_report.md
           python3 product/product_fetch.py --queue product/fetch_queue.json --limit 400 --rerank ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+
+      - name: 品質レポートを作成（件数・AI点数・保留理由）
+        if: always()
+        run: |
+          python3 product/quality_report.py --events product/quality_events.jsonl --out product/quality_report.md
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f product/quality_report.md ]; then
+            cat product/quality_report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 品質レポートを保存（7日で自動削除）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-report
+          path: |
+            product/quality_report.md
+            product/quality_events.jsonl
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 後片付け（鍵ファイルを消す）
         if: always()
