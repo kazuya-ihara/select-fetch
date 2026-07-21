@@ -1411,6 +1411,7 @@ def apply_intent_category_evidence(items, theme="", angle_title=""):
             word in theme_text for word in ("冷感", "ひんやり", "涼しい", "冷却")):
         return list(items or [])
     kept = []
+    removed = 0
     for row in items or []:
         amz = row.get("amazon") or {}
         title = norm(amz.get("title") or row.get("title") or "")
@@ -1428,8 +1429,11 @@ def apply_intent_category_evidence(items, theme="", angle_title=""):
             reason = "ペット用途の明示がなく、人用・子供用の冷感商品"
             row["ai_reason"] = (row.get("ai_reason") or "") + (
                 " / " if row.get("ai_reason") else "") + reason
+            removed += 1
             continue
         kept.append(row)
+    if removed:
+        print("    ペット冷感カテゴリフィルタ：人向け候補%d件を除外" % removed)
     return kept
 
 
