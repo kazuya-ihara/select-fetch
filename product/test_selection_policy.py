@@ -104,6 +104,14 @@ class SelectionPolicyTest(unittest.TestCase):
             angle_title="夏の室内向けのペット冷感グッズ（ひんやりで選ぶ）")
         self.assertEqual([shared], out)
 
+    def test_pet_cooling_drops_human_title_even_if_features_mention_pets(self):
+        human = make_row(90, "A", title="アイス枕 人用 冷却マット", n=1)
+        human["amazon"]["features"] = ["ペットにも使える冷感素材"]
+        out = bc.select_final_pool(
+            [human], theme="ペット冷感グッズ",
+            angle_title="夏の室内向けのペット冷感グッズ（ひんやりで選ぶ）")
+        self.assertEqual([], out)
+
     def test_amazon_review_lane_breaks_ai_score_tie(self):
         relevance = make_row(90, "A", n=1)
         reviews = make_row(90, "B", n=2)
