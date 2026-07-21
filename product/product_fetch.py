@@ -165,6 +165,8 @@ def build_pool(kw, rerank, theme="", angle="", components=None):
         rows = json.loads(tail)
         # 子プロセスへテーマ情報が届かない経路や古い候補形式でも、保存直前に同じ安全弁を通す。
         # flat な title/features 形式にも対応するため、AIの低評価を人向け商品がすり抜けない。
+        print("  保存前フィルター入力：theme=%s / angle=%s / kw=%s / rows=%d"
+              % (theme or "", angle or "", kw or "", len(rows) if isinstance(rows, list) else -1))
         filtered = apply_intent_category_evidence(
             rows, theme=theme or kw, angle_title=angle or kw)
         if len(filtered) < len(rows):
