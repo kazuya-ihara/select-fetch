@@ -103,6 +103,9 @@ jobs:
       - name: 対応済み切り口の商品を取得（→ v2_product）
         env:
           FETCH_TARGET: ${{ github.event.inputs.target || '' }}
+          PROMOTE_MIN_COUNT: ${{ github.event.inputs.target == 'カーテン|遮熱で選ぶ定番カーテン' && '3' || '4' }}
+          PROMOTE_MIN_SCORE: ${{ github.event.inputs.target == 'カーテン|遮熱で選ぶ定番カーテン' && '90' || '80' }}
+          PROMOTE_AVG_SCORE: ${{ github.event.inputs.target == 'カーテン|遮熱で選ぶ定番カーテン' && '90' || '85' }}
         run: |
           rm -f product/quality_events.jsonl product/quality_report.md
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.mode }}" = "promote" ]; then
