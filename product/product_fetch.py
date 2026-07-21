@@ -45,6 +45,11 @@ DAILY_ANGLE_LIMIT = int(os.environ.get("DAILY_ANGLE_LIMIT", "40"))  # env で上
 SLEEP_BETWEEN_ANGLES = 1.0  # 切り口間のウェイト（秒）
 REL_MIN = 70                 # build_candidates.py の公開品質基準と合わせる
 MIN_SAVE_COUNT = 3          # 0〜2件は候補収集失敗とみなし、既存結果を保持
+# 「9件の旧結果」から、少数でも質の高い結果へ昇格させる時の追加条件。
+# 通常保存・影テストの条件より厳しくし、明示的な --promote-quality の時だけ使う。
+PROMOTE_MIN_COUNT = 4
+PROMOTE_MIN_SCORE = 80
+PROMOTE_AVG_SCORE = 85
 
 
 def today_str():
@@ -207,9 +212,37 @@ def validate_new_result(rows, rerank):
     return True, ""
 
 
+def validate_quality_promotion(rows, existing_count, rerank):
+    """既存の大きな結果を、少数の高品質結果へ置き換えてよいか判定する。
+
+    これは通常保存より厳しい「昇格」専用ゲート。既存件数を下回ること自体は
+    拒否理由にせず、AIスコアの下限・平均・重複だけで安全性を担保する。
+    旧結果の件数しか取得できないため、既存商品とのスコア比較は行わない。
+    """
+    if existing_count is None or existing_count <= 0:
+        return False, "既存結果がないため昇格対象外"
+    ok, reason = validate_new_result(rows, rerank)
+    if not ok:
+        return False, reason
+    if len(rows) < PROMOTE_MIN_COUNT:
+        return False, "昇格は%d件以上（新結果=%d件）" % (PROMOTE_MIN_COUNT, len(rows))
+    if not rerank:
+        return False, "AIリランクなしの昇格は不可"
+    scores = [r.get("ai_score") for r in rows]
+    if any(not isinstance(s, (int, float)) for s in scores):
+        return False, "AIスコア不明"
+    min_score = min(scores)
+    avg_score = sum(scores) / len(scores)
+    if min_score < PROMOTE_MIN_SCORE:
+        return False, "最低AI%d点未満（最低=%d）" % (PROMOTE_MIN_SCORE, min_score)
+    if avg_score < PROMOTE_AVG_SCORE:
+        return False, "平均AI%d点未満（平均=%.1f）" % (PROMOTE_AVG_SCORE, avg_score)
+    return True, "最低AI%d点・平均AI%.1f点" % (min_score, avg_score)
+
+
 # ---------- 1切り口を取得して保存 ----------
 def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
-                   components=None, shadow=False):
+                   components=None, shadow=False, promote=False):
     label = "%s / %s" % (theme, angle or "(テーマ単位)")
     # ピン留め判定と、force時の劣化防止に同じ件数を使う。
     # 既存件数を取得できない場合は、保存を止めずに従来どおり続行する。
@@ -220,7 +253,7 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
             "p_theme": theme, "p_angle_title": angle or ""})
         if not isinstance(existing_count, int):
             existing_count = None
-        elif not force and not shadow and existing_count > 0:
+        elif not force and not shadow and not promote and existing_count > 0:
             print("  ⏭ 既に保存済み(%d件)なのでスキップ: %s" % (existing_count, label))
             return "skip"
     except Exception as e:
@@ -244,6 +277,9 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
               % (len(rows), existing_count if existing_count is not None else "不明"))
         if not quality_ok:
             print("  ◇ 品質ゲート判定: 保留（%s）" % quality_reason)
+        promote_ok, promote_reason = validate_quality_promotion(rows, existing_count, rerank)
+        print("  ◇ 正式反映候補: %s（%s）"
+              % ("可" if promote_ok else "保留", promote_reason))
         for i, row in enumerate(rows, 1):
             print("    %d. AI=%s / %s / %s / ASIN=%s"
                   % (i, row.get("ai_score") if row.get("ai_score") is not None else "未採点",
@@ -254,9 +290,17 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
         print("  ⚠ 新結果の品質ゲート不通過（%s）。保存せず既存データを保護: %s"
               % (quality_reason, label))
         return "empty"
+    if promote:
+        promote_ok, promote_reason = validate_quality_promotion(rows, existing_count, rerank)
+        if not promote_ok:
+            print("  ⚠ 昇格条件不通過（%s）。旧データを保持: %s"
+                  % (promote_reason, label))
+            return "empty"
+        print("  ✅ 昇格条件を通過（%s）。旧結果を保存前に置き換えます: %s"
+              % (promote_reason, label))
     # 手動forceでも、既存より少ない候補で置き換えない。
     # v2_product_hasは件数だけを返すため、スコア平均ではなく安全側の件数比較を行う。
-    if force and existing_count is not None and existing_count > len(rows):
+    if force and not promote and existing_count is not None and existing_count > len(rows):
         print("  ⚠ 既存%d件より新結果が少ない(%d件)ため上書きせず保護: %s"
               % (existing_count, len(rows), label))
         return "empty"
@@ -264,7 +308,7 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
     # 安全ガード：AIリランクを頼んだのに全件スコア無し＝Gemini無料枠切れ/失敗。
     # その結果で既存の“AIフィルタ済み”データを上書きすると関連性が落ちるので、
     # force でも上書きを止める（既存があれば保持し、空の切り口だけ新規挿入）。
-    replace = bool(force)
+    replace = bool(force or promote)
     ai_ran = any(r.get("ai_score") is not None for r in rows)
     if force and rerank and not ai_ran:
         print("  ⚠ AIリランク不発（枠切れ?）。既存のAI済みデータ保護のため上書きしない: %s" % label)
@@ -276,7 +320,9 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
             "p_products": rows, "p_replace": replace})
         if res == -1:
             print("  ⏭ 既存あり・上書きせずスキップ: %s" % label); return "skip"
-        print("  ✅ 保存 %s 件: %s" % (res, label)); return "saved"
+        print("  ✅ 保存 %s 件%s: %s"
+              % (res, "（品質昇格）" if promote else "", label))
+        return "promoted" if promote else "saved"
     except urllib.error.HTTPError as e:
         print("  保存失敗 HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:200]))
         return "error"
@@ -296,6 +342,8 @@ def main():
     ap.add_argument("--rerank", action="store_true", help="AIリランクも実行")
     ap.add_argument("--force", action="store_true", help="ピン留めを無視して入れ替え")
     ap.add_argument("--shadow", action="store_true", help="保存せず新候補とAI評価だけを表示")
+    ap.add_argument("--promote-quality", action="store_true",
+                    help="明示確認済みの高品質候補だけ、既存結果を置き換える")
     args = ap.parse_args()
 
     token = read_batch_token()
@@ -336,11 +384,11 @@ def main():
         if args.queue and done_fetch >= args.limit:
             print("  上限 %d 件に達したので停止。" % args.limit); break
         r = fetch_and_save(token, args.date, theme, angle, kw, args.rerank, args.force,
-                           components=components)
+                           components=components, promote=args.promote_quality)
         stats[r] = stats.get(r, 0) + 1
         if r == "limit":
             break
-        if r == "saved":       # 実取得した時だけ間隔を空ける
+        if r in ("saved", "promoted"):       # 実取得した時だけ間隔を空ける
             done_fetch += 1
             time.sleep(SLEEP_BETWEEN_ANGLES)
 

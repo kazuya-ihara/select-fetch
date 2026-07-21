@@ -218,6 +218,44 @@ class SaveQualityTest(unittest.TestCase):
                 {"asin": "C", "ai_score": 69}]
         self.assertFalse(product_fetch.validate_new_result(rows, rerank=True)[0])
 
+    def test_quality_promotion_allows_four_strong_items(self):
+        rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90},
+                {"asin": "C", "ai_score": 85}, {"asin": "D", "ai_score": 80}]
+        ok, reason = product_fetch.validate_quality_promotion(rows, 9, rerank=True)
+        self.assertTrue(ok, reason)
+
+    def test_quality_promotion_rejects_three_items_even_if_scores_are_high(self):
+        rows = [{"asin": "A", "ai_score": 100}, {"asin": "B", "ai_score": 95},
+                {"asin": "C", "ai_score": 90}]
+        ok, reason = product_fetch.validate_quality_promotion(rows, 9, rerank=True)
+        self.assertFalse(ok)
+        self.assertIn("4件以上", reason)
+
+    def test_quality_promotion_rejects_low_average(self):
+        rows = [{"asin": "A", "ai_score": 90}, {"asin": "B", "ai_score": 85},
+                {"asin": "C", "ai_score": 80}, {"asin": "D", "ai_score": 80}]
+        ok, reason = product_fetch.validate_quality_promotion(rows, 9, rerank=True)
+        self.assertFalse(ok)
+        self.assertIn("平均AI85点未満", reason)
+
+    def test_promote_can_replace_larger_existing_pool_when_gate_passes(self):
+        pool = [{"asin": "A", "ai_score": 95, "title": "A"},
+                {"asin": "B", "ai_score": 90, "title": "B"},
+                {"asin": "C", "ai_score": 85, "title": "C"},
+                {"asin": "D", "ai_score": 80, "title": "D"}]
+        rows = [{"asin": x["asin"], "ai_score": x["ai_score"]} for x in pool]
+        with mock.patch.object(product_fetch, "rpc", side_effect=[9, 4]) as rpc, \
+             mock.patch.object(product_fetch, "build_pool", return_value=pool), \
+             mock.patch.object(product_fetch, "to_rows", return_value=rows), \
+             mock.patch.object(product_fetch, "usage_load", return_value=0), \
+             mock.patch.object(product_fetch, "usage_bump"), \
+             mock.patch.object(product_fetch, "read_batch_token", return_value="token"):
+            result = product_fetch.fetch_and_save(
+                "token", "2026-07-21", "テーマ", "切り口", "検索語",
+                rerank=True, force=False, components=[], promote=True)
+        self.assertEqual("promoted", result)
+        self.assertEqual(2, rpc.call_count)
+
     def test_force_does_not_replace_a_larger_existing_pool(self):
         pool = [{"asin": "A", "ai_score": 95, "title": "A"},
                 {"asin": "B", "ai_score": 90, "title": "B"},
