@@ -34,6 +34,7 @@ jobs:
     env:
       TZ: Asia/Tokyo
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      QUALITY_REPORT_PATH: product/quality_events.jsonl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -90,6 +91,7 @@ jobs:
 
       - name: 対応済み切り口の商品を取得（→ v2_product）
         run: |
+          rm -f product/quality_events.jsonl product/quality_report.md
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.mode }}" = "promote" ]; then
             python3 product/fetch_claimed.py --rerank --limit 40 --promote-quality --confirm-promote --snapshot-file product/shadow_results.json
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -97,6 +99,25 @@ jobs:
           else
             python3 product/fetch_claimed.py --rerank --limit 40
           fi
+
+      - name: 品質レポートを作成（件数・AI点数・保留理由）
+        if: always()
+        run: |
+          python3 product/quality_report.py --events product/quality_events.jsonl --out product/quality_report.md
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f product/quality_report.md ]; then
+            cat product/quality_report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 品質レポートを保存（手動実行の確認用・7日で自動削除）
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-report
+          path: |
+            product/quality_report.md
+            product/quality_events.jsonl
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 影テスト結果を保存（正式反映用・7日で自動削除）
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'shadow'
