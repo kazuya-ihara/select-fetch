@@ -115,9 +115,26 @@ def die(m):
     sys.exit(1)
 
 
+def empty_reason_code(msg):
+    """空プールの理由を、ログに安全に残せる固定コードへ変換する。"""
+    text = str(msg or "")
+    if "AI設定が無いため" in text:
+        return "config_missing"
+    if "Amazonの関連性順・評価順・救済検索がすべて0件" in text:
+        return "search_empty"
+    if "AI採点が未完了" in text:
+        return "ai_incomplete"
+    if "品質基準を満たす商品が0件" in text:
+        return "ai_filtered"
+    return "unknown_empty"
+
+
 def emit_empty(want_json, msg):
     """0件は異常ではなく正常な探索結果。die(=exit1)せず空プールを正常返しする。
     --json時は build_pool が読む契約(---- JSON ----)に合わせて空配列[]を出す。"""
+    # product_fetch.py が商品名や外部APIの応答を取り込まずに分類できるよう、
+    # 固定コードだけを別行で出す。機密情報・検索語はここへ出さない。
+    print("QUALITY_REASON:" + empty_reason_code(msg))
     print("・" + msg + "（空プールを返します）")
     if want_json:
         print("\n---- JSON ----")

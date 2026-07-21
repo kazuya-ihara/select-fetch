@@ -54,6 +54,18 @@ PROMOTE_MIN_SCORE = int(os.environ.get("PROMOTE_MIN_SCORE", "80"))
 PROMOTE_AVG_SCORE = int(os.environ.get("PROMOTE_AVG_SCORE", "85"))
 QUALITY_REPORT_PATH = os.environ.get("QUALITY_REPORT_PATH", "").strip()
 
+POOL_REASON_LABELS = {
+    "config_missing": "AI設定がない",
+    "search_empty": "検索結果が0件（Amazon関連性・評価・救済）",
+    "ai_incomplete": "AI採点未完了",
+    "ai_filtered": "AI/品質フィルター後0件",
+    "safety_filtered": "表示前の安全フィルターで除外",
+    "candidate_format": "候補データの形式不正",
+    "timeout": "取得処理タイムアウト",
+    "build_error": "取得処理エラー",
+    "unknown_empty": "候補プールが空（原因不明）",
+}
+
 
 def today_str():
     # JST（Macのローカル時刻）基準の当日
@@ -139,8 +151,15 @@ def clean_price(p):
     return int(digits) if digits else None
 
 
-def build_pool(kw, rerank, theme="", angle="", components=None):
+def build_pool(kw, rerank, theme="", angle="", components=None, return_reason=False):
     """検索kwと切り口意図を分離して build_candidates.py へ渡す。"""
+    def finish(pool, reason=""):
+        return (pool, reason) if return_reason else pool
+
+    def reason_from_output(text):
+        match = re.search(r"^QUALITY_REASON:([a-z_]+)\s*$", text or "", re.MULTILINE)
+        return match.group(1) if match else "unknown_empty"
+
     cmd = [sys.executable, BUILD, kw, "--json"]
     if theme:
         cmd += ["--theme", theme]
@@ -157,21 +176,20 @@ def build_pool(kw, rerank, theme="", angle="", components=None):
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
     except subprocess.TimeoutExpired:
-        print("  build_candidates がタイムアウト"); return None
+        print("  build_candidates がタイムアウト"); return finish(None, "timeout")
     if out.returncode != 0:
-        # die() の理由は stdout 末尾に出る（候補ゼロ / Amazon解決0件 など）
-        reason = (out.stderr or "").strip()
-        if not reason and out.stdout:
-            lines = [l.strip() for l in out.stdout.splitlines() if l.strip()]
-            reason = lines[-1] if lines else ""
-        print("  この切り口は取得できず（%s）→ スキップ" % ((reason or "候補ゼロ/Amazon解決0件")[:120])); return None
+        print("  この切り口は取得処理エラー（終了コード%d）→ スキップ" % out.returncode)
+        return finish(None, "build_error")
     txt = out.stdout
     if "---- JSON ----" not in txt:
-        print("  JSON出力が見つからない（キー未設定か候補ゼロ？）"); return None
+        print("  JSON出力が見つからない（候補結果の形式不正）"); return finish(None, "candidate_format")
     tail = txt.split("---- JSON ----", 1)[1]
     tail = tail.split("\n==== 見方", 1)[0].strip()
     try:
         rows = json.loads(tail)
+        if not isinstance(rows, list):
+            print("  候補結果が配列ではない（候補データの形式不正）")
+            return finish(None, "candidate_format")
         # 子プロセスへテーマ情報が届かない経路や古い候補形式でも、保存直前に同じ安全弁を通す。
         # flat な title/features 形式にも対応するため、AIの低評価を人向け商品がすり抜けない。
         filtered = apply_intent_category_evidence(
@@ -179,9 +197,14 @@ def build_pool(kw, rerank, theme="", angle="", components=None):
         if len(filtered) < len(rows):
             print("  ペット冷感カテゴリフィルタ（保存前）：人向け候補%d件を除外"
                   % (len(rows) - len(filtered)))
-        return filtered
-    except Exception as e:
-        print("  JSON解析失敗:", e); return None
+        if rows and not filtered:
+            return finish([], "safety_filtered")
+        if not filtered:
+            return finish([], reason_from_output(txt))
+        return finish(filtered, "")
+    except Exception:
+        print("  JSON解析失敗（候補データの形式不正）")
+        return finish(None, "candidate_format")
 
 
 def to_rows(pool):
@@ -375,11 +398,19 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
         return "limit"
 
     print("  ▶ 取得: %s（kw=%s）rerank=%s" % (label, kw, rerank))
-    pool = build_pool(kw, rerank, theme=theme, angle=angle, components=components)
+    pool_result = build_pool(
+        kw, rerank, theme=theme, angle=angle, components=components, return_reason=True)
+    # 既存のMac用テストや外部スクリプトが build_pool を差し替えても壊れないよう、
+    # 従来どおりリストだけを返す実装も受け入れる。
+    if isinstance(pool_result, tuple) and len(pool_result) == 2:
+        pool, pool_reason = pool_result
+    else:
+        pool, pool_reason = pool_result, "unknown_empty"
     if not pool:
         print("  × プールが空。保存せず。")
         quality_event("empty", catalog_date, theme, angle,
-                      reason="候補プールが空", mode="shadow" if shadow else "normal")
+                      reason=POOL_REASON_LABELS.get(pool_reason, POOL_REASON_LABELS["unknown_empty"]),
+                      mode="shadow" if shadow else "normal")
         return "empty"
     rows = to_rows(pool)
     # 表示・保存用の最終形式へ変換した後にも再確認する。取得元ごとの形式差で

@@ -107,6 +107,10 @@ def render(events: Iterable[dict], generated_at=None) -> str:
         and e.get("reason")
         and e.get("reason") not in {"保存完了", "品質昇格", "正式反映条件を通過"}
     )
+    empty_reasons = collections.Counter(
+        _safe_text(e.get("reason")) for e in events
+        if e.get("status") == "empty" and e.get("reason")
+    )
     when = generated_at or _now_jst().strftime("%Y-%m-%d %H:%M JST")
 
     lines = [
@@ -142,6 +146,11 @@ def render(events: Iterable[dict], generated_at=None) -> str:
     if reasons:
         lines += ["", "## 保留・失敗の主な理由", ""]
         for reason, count in reasons.most_common(12):
+            lines.append("- %d件: %s" % (count, reason))
+
+    if empty_reasons:
+        lines += ["", "## 候補なしの内訳", ""]
+        for reason, count in empty_reasons.most_common(12):
             lines.append("- %d件: %s" % (count, reason))
 
     lines += ["", "## 切り口別", "", "| テーマ | 切り口 | 結果 | 商品数 | AI点数 | 理由 |",
