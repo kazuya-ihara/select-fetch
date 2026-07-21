@@ -61,6 +61,17 @@ def main():
     ap.add_argument("--limit", type=int, default=40)
     args = ap.parse_args()
 
+    # GitHubの手動実行は、誤操作で全切り口を一度に再取得しないよう安全側に制限する。
+    # 定期実行(schedule)とMac実行には影響しない。必要なら環境変数で上限だけ調整できる。
+    manual_run = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    run_limit = args.limit
+    run_force = args.force
+    if manual_run:
+        manual_cap = int(os.environ.get("MANUAL_TEST_LIMIT", "3"))
+        run_limit = min(args.limit, max(1, manual_cap))
+        run_force = True
+        print("手動テストモード: 最大%d切り口・既存結果を比較して安全に更新" % run_limit)
+
     token = pf.read_batch_token()
     if not token:
         print("‼ 書込トークン未設定（sources/service_key.txt / BATCH_TOKEN）"); sys.exit(1)
@@ -107,12 +118,12 @@ def main():
     stats = {"saved": 0, "skip": 0, "empty": 0, "error": 0, "limit": 0, "nokw": 0}
     done_fetch = 0
     for cdate, theme, angle, spec in targets:
-        if done_fetch >= args.limit:
-            print("  上限 %d 件に達したので停止。" % args.limit); break
+        if done_fetch >= run_limit:
+            print("  上限 %d 件に達したので停止。" % run_limit); break
         kw = (spec or {}).get("kw")
         if not kw:
             print("  × kw不明（カタログに該当切り口なし）: %s / %s" % (theme, angle)); stats["nokw"] += 1; continue
-        r = pf.fetch_and_save(token, cdate, theme, angle, kw, args.rerank, args.force,
+        r = pf.fetch_and_save(token, cdate, theme, angle, kw, args.rerank, run_force,
                               components=(spec or {}).get("components") or [])
         stats[r] = stats.get(r, 0) + 1
         if r == "limit":
