@@ -17,6 +17,32 @@ product/product_usage.json
 product/learning.json
 product/fetch_queue.json
 product/shadow_results.json
+product/quality_events.jsonl
+product/quality_report.md
+product/採点シート.html
+**/__pycache__/
+.DS_Store
+
+# 例ファイル(*.example.json)と learning_seed.json はコミットしてOK（機密でない）
+# === 機密：絶対にコミットしない（鍵・トークン）===
+product/shopping_api.json
+product/amazon_creators.json
+product/gemini_api.json
+product/gemini_api.json.bak
+sources/service_key.txt
+sources/supabase_config.json
+
+# === 飯の種：この公開リポジトリには存在させない（万一コピーしても弾く）===
+batch/
+memory/
+data/
+
+# === 自動生成（コミット不要）===
+product/gemini_usage.json
+product/product_usage.json
+product/learning.json
+product/fetch_queue.json
+product/shadow_results.json
 product/採点シート.html
 **/__pycache__/
 .DS_Store
