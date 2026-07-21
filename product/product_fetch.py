@@ -166,7 +166,7 @@ def build_pool(kw, rerank, theme="", angle="", components=None):
         # 子プロセスへテーマ情報が届かない経路や古い候補形式でも、保存直前に同じ安全弁を通す。
         # flat な title/features 形式にも対応するため、AIの低評価を人向け商品がすり抜けない。
         filtered = apply_intent_category_evidence(
-            rows, theme=theme, angle_title=angle)
+            rows, theme=theme or kw, angle_title=angle or kw)
         if len(filtered) < len(rows):
             print("  ペット冷感カテゴリフィルタ（保存前）：人向け候補%d件を除外"
                   % (len(rows) - len(filtered)))
