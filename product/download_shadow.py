@@ -16,15 +16,57 @@ import urllib.request
 import zipfile
 
 
+GITHUB_API_VERSION = "2026-03-10"
+
+
 def api_get(url, token, accept="application/vnd.github+json"):
     req = urllib.request.Request(url, headers={
         "Accept": accept,
         "Authorization": "Bearer " + token,
-        "X-GitHub-Api-Version": "2022-11-28",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
         "User-Agent": "select-fetch-shadow-reuse",
     })
     with urllib.request.urlopen(req, timeout=30) as res:
         return res.read()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """GitHub APIの302を、署名付きURLへ認証ヘッダーを持ち越さず処理する。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def download_artifact(artifact_url, token):
+    """GitHub APIの302を一度受け、署名付きURLを無認証で取得する。
+
+    APIのダウンロード先は短時間だけ有効なAzure Blobの署名URLになる。
+    GitHubトークンをその別ドメインへ転送すると、ダウンロードが401/403で
+    拒否されることがあるため、302を手動で処理してヘッダーを分離する。
+    """
+    req = urllib.request.Request(artifact_url, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + token,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "User-Agent": "select-fetch-shadow-reuse",
+    })
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=30) as res:
+            return res.read()
+    except urllib.error.HTTPError as e:
+        if e.code != 302:
+            raise
+        location = e.headers.get("Location")
+        e.close()
+        if not location:
+            raise RuntimeError("成果物の署名付きURLが返されませんでした")
+        # 署名URLにはGitHubトークンを付けない。URL自体もログに出さない。
+        signed_req = urllib.request.Request(location, headers={
+            "User-Agent": "select-fetch-shadow-reuse",
+        })
+        with urllib.request.urlopen(signed_req, timeout=30) as res:
+            return res.read()
 
 
 def fail(message):
@@ -78,8 +120,8 @@ def main():
         if not artifact or not artifact.get("id"):
             continue
         try:
-            raw_zip = api_get(base + "/actions/artifacts/%s/zip" % artifact["id"], token,
-                              accept="application/vnd.github+json")
+            raw_zip = download_artifact(
+                base + "/actions/artifacts/%s/zip" % artifact["id"], token)
             with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
                 names = [n for n in zf.namelist()
                          if n == "shadow_results.json" or n.endswith("/shadow_results.json")]
@@ -96,7 +138,12 @@ def main():
             return 0
         except (zipfile.BadZipFile, KeyError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        except Exception:
+        except urllib.error.HTTPError as e:
+            # トークンや署名URLは出さず、切り分けに必要なHTTPコードだけ残す。
+            print("  成果物%dの取得をスキップ（HTTP %s）" % (artifact.get("id", 0), e.code))
+            continue
+        except Exception as e:
+            print("  成果物%dの取得をスキップ（%s）" % (artifact.get("id", 0), type(e).__name__))
             continue
 
     return fail("有効な影テスト成果物が見つかりません。正式反映は行いません（既存結果は変更しません）。")
