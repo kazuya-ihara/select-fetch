@@ -27,6 +27,7 @@ build_candidates.py（①除外/照合ゲート＋②多源コンセンサス＋
 import os, re, sys, json, time, argparse, datetime, subprocess
 import urllib.request, urllib.error
 import socket as _socket; _socket.setdefaulttimeout(90)  # 保険：明示timeout無しの通信でも固まらない
+from build_candidates import apply_intent_category_evidence
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -161,7 +162,15 @@ def build_pool(kw, rerank, theme="", angle="", components=None):
     tail = txt.split("---- JSON ----", 1)[1]
     tail = tail.split("\n==== 見方", 1)[0].strip()
     try:
-        return json.loads(tail)
+        rows = json.loads(tail)
+        # 子プロセスへテーマ情報が届かない経路や古い候補形式でも、保存直前に同じ安全弁を通す。
+        # flat な title/features 形式にも対応するため、AIの低評価を人向け商品がすり抜けない。
+        filtered = apply_intent_category_evidence(
+            rows, theme=theme, angle_title=angle)
+        if len(filtered) < len(rows):
+            print("  ペット冷感カテゴリフィルタ（保存前）：人向け候補%d件を除外"
+                  % (len(rows) - len(filtered)))
+        return filtered
     except Exception as e:
         print("  JSON解析失敗:", e); return None
 

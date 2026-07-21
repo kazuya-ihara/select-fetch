@@ -1407,10 +1407,8 @@ def apply_intent_category_evidence(items, theme="", angle_title=""):
     「人用・ペット用」の兼用品を誤って落としすぎない。
     """
     theme_text = norm(" ".join([theme or "", angle_title or ""]))
-    print("    カテゴリ判定入力：テーマ=%s / 切り口=%s" % (theme or "", angle_title or ""))
     if "ペット" not in theme_text or not any(
             word in theme_text for word in ("冷感", "ひんやり", "涼しい", "冷却")):
-        print("    ペット冷感カテゴリフィルタ：対象外")
         return list(items or [])
     kept = []
     removed = 0
