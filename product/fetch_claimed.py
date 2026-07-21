@@ -26,6 +26,7 @@ LOCAL_CATALOG = os.path.join(ROOT, "data", "catalog", "latest.json")
 CLAIM_DAYS = int(os.environ.get("CLAIM_DAYS", "2"))
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_MAX_AGE_HOURS = 72
+TARGET_SPEC_ENV = "FETCH_TARGET"
 
 
 def load_catalog(token, date=None):
@@ -188,6 +189,18 @@ def main():
         seen.add(key)
         spec = angles_for(cdate).get((theme, angle))
         targets.append((cdate, theme, angle, spec))
+
+    target_spec = os.environ.get(TARGET_SPEC_ENV, "").strip()
+    if target_spec:
+        if "|" not in target_spec:
+            print("‼ 対象指定の形式が不正です（テーマ|切り口で指定してください）。既存データは変更しません。")
+            return
+        target_theme, target_angle = [part.strip() for part in target_spec.split("|", 1)]
+        targets = [t for t in targets if t[1] == target_theme and t[2] == target_angle]
+        print("対象指定: %s / %s" % (target_theme, target_angle))
+        if not targets:
+            print("指定された切り口が対応済み一覧にありません。既存データは変更しません。")
+            return
 
     print("=" * 60)
     print("最新カタログ=%s ／ 対応済み切り口=%d件（直近7日） ／ rerank=%s" % (date, len(targets), args.rerank))
