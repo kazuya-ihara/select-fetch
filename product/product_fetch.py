@@ -351,6 +351,14 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
     if not pool:
         print("  × プールが空。保存せず。"); return "empty"
     rows = to_rows(pool)
+    # 表示・保存用の最終形式へ変換した後にも再確認する。取得元ごとの形式差で
+    # 人向け商品が候補プールをすり抜けても、v2_product へ渡す直前に止める。
+    guarded_rows = apply_intent_category_evidence(
+        rows, theme=theme or kw, angle_title=angle or kw)
+    if len(guarded_rows) < len(rows):
+        print("  ペット冷感カテゴリフィルタ（表示前）：人向け候補%d件を除外"
+              % (len(rows) - len(guarded_rows)))
+    rows = guarded_rows
     if not rows:
         print("  × 有効なASINが0件。保存せず。"); return "empty"
     quality_ok, quality_reason = validate_new_result(rows, rerank)
