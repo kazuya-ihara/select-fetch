@@ -58,6 +58,14 @@ POOL_REASON_LABELS = {
     "config_missing": "AI設定がない",
     "search_empty": "検索結果が0件（Amazon関連性・評価・救済）",
     "ai_incomplete": "AI採点未完了",
+    "ai_budget_exhausted": "AI共有予算の上限",
+    "ai_http_429": "AI無料枠・レート制限（429）",
+    "ai_http_5xx": "AI一時障害（5xx）",
+    "ai_http_error": "AI通信エラー",
+    "ai_network_error": "AI通信失敗",
+    "ai_timeout": "AI通信タイムアウト",
+    "ai_parse_error": "AI応答形式エラー",
+    "ai_empty_response": "AI応答が空",
     "ai_filtered": "AI/品質フィルター後0件",
     "safety_filtered": "表示前の安全フィルターで除外",
     "candidate_format": "候補データの形式不正",
@@ -158,7 +166,17 @@ def build_pool(kw, rerank, theme="", angle="", components=None, return_reason=Fa
 
     def reason_from_output(text):
         match = re.search(r"^QUALITY_REASON:([a-z_]+)\s*$", text or "", re.MULTILINE)
-        return match.group(1) if match else "unknown_empty"
+        reason = match.group(1) if match else "unknown_empty"
+        if reason != "ai_incomplete":
+            return reason
+        # build_candidates は秘密情報を出さず、許可済み固定コードだけを返す。
+        diag = re.search(
+            r"^AI_DIAGNOSTIC:(config_missing|budget_exhausted|http_429|http_5xx|"
+            r"http_error|network_error|timeout|parse_error|empty_response)\s*$",
+            text or "", re.MULTILINE)
+        if diag:
+            return "ai_" + diag.group(1)
+        return reason
 
     cmd = [sys.executable, BUILD, kw, "--json"]
     if theme:
@@ -407,9 +425,12 @@ def fetch_and_save(token, catalog_date, theme, angle, kw, rerank, force,
     else:
         pool, pool_reason = pool_result, "unknown_empty"
     if not pool:
+        pool_label = POOL_REASON_LABELS.get(pool_reason, POOL_REASON_LABELS["unknown_empty"])
+        if pool_reason.startswith("ai_"):
+            print("  AI診断: " + pool_label)
         print("  × プールが空。保存せず。")
         quality_event("empty", catalog_date, theme, angle,
-                      reason=POOL_REASON_LABELS.get(pool_reason, POOL_REASON_LABELS["unknown_empty"]),
+                      reason=pool_label,
                       mode="shadow" if shadow else "normal")
         return "empty"
     rows = to_rows(pool)

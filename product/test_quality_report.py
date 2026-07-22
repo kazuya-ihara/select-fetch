@@ -42,6 +42,36 @@ class QualityReportTest(unittest.TestCase):
         self.assertEqual([], pool)
         self.assertEqual("search_empty", reason)
 
+    def test_build_pool_classifies_safe_ai_budget_diagnostic(self):
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=("QUALITY_REASON:ai_incomplete\n"
+                    "AI_DIAGNOSTIC:budget_exhausted\n"
+                    "---- JSON ----\n[]\n==== 見方 ====\n"),
+            stderr="",
+        )
+        with mock.patch.object(product_fetch.subprocess, "run", return_value=completed):
+            pool, reason = product_fetch.build_pool(
+                "枕 高さ", True, theme="枕", angle="高さで選ぶ",
+                return_reason=True)
+        self.assertEqual([], pool)
+        self.assertEqual("ai_budget_exhausted", reason)
+
+    def test_build_pool_ignores_unknown_ai_diagnostic(self):
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=("QUALITY_REASON:ai_incomplete\n"
+                    "AI_DIAGNOSTIC:secret_key_would_not_be_allowed\n"
+                    "---- JSON ----\n[]\n==== 見方 ====\n"),
+            stderr="",
+        )
+        with mock.patch.object(product_fetch.subprocess, "run", return_value=completed):
+            pool, reason = product_fetch.build_pool(
+                "枕 高さ", True, theme="枕", angle="高さで選ぶ",
+                return_reason=True)
+        self.assertEqual([], pool)
+        self.assertEqual("ai_incomplete", reason)
+
     def test_build_pool_classifies_safety_filter_after_candidates(self):
         completed = types.SimpleNamespace(
             returncode=0,
