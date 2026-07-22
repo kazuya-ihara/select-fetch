@@ -27,6 +27,7 @@ CLAIM_DAYS = int(os.environ.get("CLAIM_DAYS", "2"))
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_MAX_AGE_HOURS = 72
 TARGET_SPEC_ENV = "FETCH_TARGET"
+CUSTOM_TARGET_LIMIT = 3
 
 
 def load_catalog(token, date=None):
@@ -56,6 +57,32 @@ def angle_map(payload):
                     "components": a.get("c") or [],
                 }
     return m
+
+
+def parse_custom_targets(text, limit=CUSTOM_TARGET_LIMIT):
+    """任意影テスト用の テーマ|切り口|検索語 を解釈する。
+
+    通常の FETCH_TARGET（テーマ|切り口）と区別するため、3項目の行が
+    1つでもあればカスタム指定として扱う。空欄や重複は除外し、最大3件。
+    """
+    lines = [line.strip() for line in (text or "").splitlines()
+             if line.strip() and not line.strip().startswith("#")]
+    if not any(line.count("|") >= 2 for line in lines):
+        return None
+    out, seen = [], set()
+    for line in lines:
+        parts = [p.strip() for p in line.split("|", 2)]
+        if len(parts) != 3 or not all(parts):
+            raise ValueError("任意影テストは テーマ|切り口|検索語 の形式で指定してください")
+        key = tuple(parts)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"theme": parts[0], "angle": parts[1], "kw": parts[2],
+                    "components": []})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _utc_now():
@@ -191,16 +218,32 @@ def main():
         targets.append((cdate, theme, angle, spec))
 
     target_spec = os.environ.get(TARGET_SPEC_ENV, "").strip()
+    custom_mode = False
     if target_spec:
-        if "|" not in target_spec:
+        try:
+            custom_targets = parse_custom_targets(target_spec)
+        except ValueError as e:
+            print("‼ 対象指定の形式が不正です: %s" % e)
+            return
+        if custom_targets is not None:
+            if run_promote:
+                print("‼ 任意テーマは保存できません。影テスト（mode=shadow）で実行してください。")
+                return
+            custom_mode = True
+            targets = [(date, item["theme"], item["angle"], item)
+                       for item in custom_targets]
+            run_limit = min(run_limit, len(targets))
+            print("任意テーマ影テスト: %d件（DBには保存しません）" % len(targets))
+        elif "|" not in target_spec:
             print("‼ 対象指定の形式が不正です（テーマ|切り口で指定してください）。既存データは変更しません。")
             return
-        target_theme, target_angle = [part.strip() for part in target_spec.split("|", 1)]
-        targets = [t for t in targets if t[1] == target_theme and t[2] == target_angle]
-        print("対象指定: %s / %s" % (target_theme, target_angle))
-        if not targets:
-            print("指定された切り口が対応済み一覧にありません。既存データは変更しません。")
-            return
+        else:
+            target_theme, target_angle = [part.strip() for part in target_spec.split("|", 1)]
+            targets = [t for t in targets if t[1] == target_theme and t[2] == target_angle]
+            print("対象指定: %s / %s" % (target_theme, target_angle))
+            if not targets:
+                print("指定された切り口が対応済み一覧にありません。既存データは変更しません。")
+                return
 
     print("=" * 60)
     print("最新カタログ=%s ／ 対応済み切り口=%d件（直近7日） ／ rerank=%s" % (date, len(targets), args.rerank))
