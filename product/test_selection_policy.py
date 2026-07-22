@@ -205,6 +205,39 @@ class SelectionPolicyTest(unittest.TestCase):
 
 
 class IntentTransportTest(unittest.TestCase):
+    def test_candidate_diagnostic_keeps_only_safe_counts(self):
+        raw = (
+            'CANDIDATE_DIAGNOSTIC:{"search_candidates":8,"duplicate_removed":2,'
+            '"ai_low_score":6,"final_candidates":0,"secret":"do-not-show"}\n')
+        self.assertEqual({
+            "search_candidates": 8,
+            "duplicate_removed": 2,
+            "ai_low_score": 6,
+            "final_candidates": 0,
+        }, product_fetch.parse_candidate_diagnostic(raw))
+
+    def test_build_pool_prints_candidate_diagnostic(self):
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=(
+                'CANDIDATE_DIAGNOSTIC:{"search_candidates":4,"duplicate_removed":1,'
+                '"ai_low_score":3,"final_candidates":0}\n'
+                "---- JSON ----\n[]\n==== 見方 ====\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(product_fetch.subprocess, "run", return_value=completed) as run, \
+             mock.patch("builtins.print") as printed:
+            result = product_fetch.build_pool("部屋干し 生乾き臭", True,
+                                              theme="部屋干しグッズ",
+                                              angle="雨の日の部屋干しグッズ")
+        self.assertEqual([], result)
+        output = " ".join(str(call.args[0]) for call in printed.call_args_list if call.args)
+        self.assertIn("候補内訳", output)
+        self.assertIn("検索候補4件", output)
+        self.assertIn("AI低評価3件", output)
+        self.assertTrue(run.called)
+
     def test_claimed_catalog_map_keeps_components(self):
         payload = {"ANGLE_DATA": {"自転車": {"angles": [{
             "t": "初心者の「パンク」に応える自転車",

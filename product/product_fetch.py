@@ -75,6 +75,46 @@ POOL_REASON_LABELS = {
 }
 
 
+def parse_candidate_diagnostic(text):
+    """build_candidates.py が出す件数だけの内訳を安全に読み取る。"""
+    match = re.search(r"^CANDIDATE_DIAGNOSTIC:(\{.*\})\s*$", text or "", re.MULTILINE)
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    # 表示・ログに使うのは固定キーの整数だけ。商品情報や検索語は受け取らない。
+    out = {}
+    for key in ("search_candidates", "lane_or_brand_limited", "duplicate_removed",
+                "variant_removed", "ai_low_score", "ai_unscored", "final_candidates"):
+        number = value.get(key)
+        if isinstance(number, int) and number >= 0:
+            out[key] = number
+    reason = value.get("empty_reason")
+    if isinstance(reason, str) and re.fullmatch(r"[a-z_]{1,40}", reason):
+        out["empty_reason"] = reason
+    return out or None
+
+
+def print_candidate_diagnostic(diag):
+    """候補がどこで減ったかを、非エンジニア向けに1行で表示する。"""
+    if not diag:
+        return
+    duplicates = (diag.get("duplicate_removed", 0)
+                  + diag.get("variant_removed", 0))
+    print("  候補内訳: 検索候補%d件 / 整理・ブランド上限%d件 / 重複・類似除外%d件"
+          " / AI低評価%d件 / AI未採点%d件 / 最終候補%d件"
+          % (diag.get("search_candidates", 0),
+             diag.get("lane_or_brand_limited", 0),
+             duplicates,
+             diag.get("ai_low_score", 0),
+             diag.get("ai_unscored", 0),
+             diag.get("final_candidates", 0)))
+
+
 def today_str():
     # JST（Macのローカル時刻）基準の当日
     return datetime.date.today().isoformat()
@@ -199,6 +239,7 @@ def build_pool(kw, rerank, theme="", angle="", components=None, return_reason=Fa
         print("  この切り口は取得処理エラー（終了コード%d）→ スキップ" % out.returncode)
         return finish(None, "build_error")
     txt = out.stdout
+    print_candidate_diagnostic(parse_candidate_diagnostic(txt))
     if "---- JSON ----" not in txt:
         print("  JSON出力が見つからない（候補結果の形式不正）"); return finish(None, "candidate_format")
     tail = txt.split("---- JSON ----", 1)[1]

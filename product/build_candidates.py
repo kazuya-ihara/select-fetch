@@ -144,6 +144,23 @@ def emit_empty(want_json, msg):
     sys.exit(0)
 
 
+def emit_candidate_diagnostic(data):
+    """候補が減った場所を、件数だけ安全にログへ出す。
+
+    商品名・検索語・API応答は含めず、原因切り分けに必要な件数だけを残す。
+    product_fetch.py がこの1行を拾い、Actionsのログにも人向けに表示する。
+    """
+    safe = {}
+    for key, value in (data or {}).items():
+        if isinstance(value, bool):
+            safe[key] = value
+        elif isinstance(value, int):
+            safe[key] = value
+        elif key == "empty_reason" and isinstance(value, str):
+            safe[key] = value[:40]
+    print("CANDIDATE_DIAGNOSTIC:" + json.dumps(safe, ensure_ascii=False, sort_keys=True))
+
+
 def norm(s):
     """全角半角ゆらぎを吸収して小文字化（比較用）。"""
     if not s:
@@ -1725,6 +1742,16 @@ def main():
     )
     resolved, tried, dropped = amazon_direct_candidates(
         c, token, primary_query, fallback_queries=fallback_queries)
+    diagnostics = {
+        "search_candidates": len(resolved),
+        "search_dropped": len(dropped),
+        "lane_or_brand_limited": 0,
+        "duplicate_removed": 0,
+        "variant_removed": 0,
+        "ai_low_score": 0,
+        "ai_unscored": 0,
+        "final_candidates": 0,
+    }
     print("\n[1] Amazon直接候補: %d件（クエリ=%s）" % (len(resolved), primary_query))
     for log in tried:
         suffix = " / ERROR=" + log["error"] if log.get("error") else ""
@@ -1734,18 +1761,24 @@ def main():
         for title, why in dropped[:6]:
             print("      ✗ %s … %s" % (title[:44], why))
     if not resolved:
+        diagnostics["empty_reason"] = "search_empty"
+        emit_candidate_diagnostic(diagnostics)
         emit_empty(want_json, "Amazonの関連性順・評価順・救済検索がすべて0件")
 
     # --- 2. AI投入前にレーン分散・ブランド偏り・重複を圧縮 ---
+    before_lane_limit = len(resolved)
     resolved = select_rerank_candidates(resolved)
+    diagnostics["lane_or_brand_limited"] = max(0, before_lane_limit - len(resolved))
     best = {}
     for r in resolved:
         k = dedup_key(r)
         if k not in best:
             best[k] = r
     uniq = list(best.values())
+    diagnostics["duplicate_removed"] = max(0, len(resolved) - len(uniq))
     _before_var = len(uniq)
     uniq = collapse_variants(uniq)
+    diagnostics["variant_removed"] = max(0, _before_var - len(uniq))
     if _before_var != len(uniq):
         print("    同ブランドの重複/色サイズ違いを %d件 畳み込み" % (_before_var - len(uniq)))
     multi = sum(1 for r in uniq if r["consensus"] >= 2)
@@ -1768,8 +1801,14 @@ def main():
             _few = (LEARN.get("few_shot") if LEARN else None) or None
             uniq, reranked = gemini_rerank(
                 gconf, intent["intent_text"], intent["intent_key"], uniq, few_shot=_few)
-            if not reranked:
-                emit_empty(want_json, "AI採点が未完了。未採点候補は公開しません")
+        if not reranked:
+            diagnostics["ai_unscored"] = sum(1 for r in uniq if r.get("ai_score") is None)
+            diagnostics["ai_low_score"] = sum(
+                1 for r in uniq if isinstance(r.get("ai_score"), (int, float))
+                and r.get("ai_score") < REL_MIN)
+            diagnostics["empty_reason"] = "ai_incomplete"
+            emit_candidate_diagnostic(diagnostics)
+            emit_empty(want_json, "AI採点が未完了。未採点候補は公開しません")
 
     # --- 4. 適格候補だけから最大6件を選ぶ。除外候補・同ブランド超過分は復活させない。 ---
     before_relevance = len(uniq)
@@ -1783,10 +1822,18 @@ def main():
     if want_rerank:
         rejected = before_relevance - sum(
             1 for r in uniq if r.get("ai_score") is not None and r.get("ai_score") >= REL_MIN)
+        diagnostics["ai_unscored"] = sum(1 for r in uniq if r.get("ai_score") is None)
+        diagnostics["ai_low_score"] = sum(
+            1 for r in uniq if isinstance(r.get("ai_score"), (int, float))
+            and r.get("ai_score") < REL_MIN)
         print("    関連性フィルタ：スコア<%d または未採点 %d件を不可逆に除外"
               % (REL_MIN, rejected))
+    diagnostics["final_candidates"] = len(pool)
     if not pool:
+        diagnostics["empty_reason"] = "ai_filtered" if want_rerank else "unknown_empty"
+        emit_candidate_diagnostic(diagnostics)
         emit_empty(want_json, "品質基準を満たす商品が0件")
+    emit_candidate_diagnostic(diagnostics)
     print("    最終選抜：最大%d件／1ブランド最大%d件（不足時も水増しなし）"
           % (TARGET_MAX, MAX_PER_BRAND))
 
