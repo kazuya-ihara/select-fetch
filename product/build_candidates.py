@@ -56,6 +56,13 @@ MAX_PER_PRODUCT_TYPE = 2
 # 広いカテゴリ語は、切り口検索で取りこぼした商品を補うための補助レーン。
 # 評価順検索は行わず、1切り口あたりの追加Amazon呼び出しを1回に抑える。
 AMAZON_BROAD_LANE_COUNT = 6
+# 補助レーンは「主検索だけでは候補が足りない時」の保険として使う。
+# 主検索でこの件数に届く場合は、広い検索結果をAIに渡さず無料枠を節約する。
+BROAD_FALLBACK_TRIGGER_COUNT = 5
+# 広い検索から入った商品は、主検索よりノイズが混ざりやすいので入口を厳しくする。
+BROAD_MIN_AI_SCORE = 90
+# 補助検索だけで同じ商品種を何個も入れない。
+BROAD_MAX_PER_PRODUCT_TYPE = 1
 
 # ---- レート配慮（無料枠を超えないための最小限のウェイト）----
 SLEEP_BETWEEN_AMAZON = 0.6   # Amazon searchItems 連打の間隔（秒）
@@ -744,6 +751,12 @@ def merge_amazon_rows(groups):
         lanes = set(row["candidate"].get("amazon_lanes") or [])
         row["consensus"] = len(lanes)
         row["sources"] = ["amazon"]
+        # broadしか持たないASINだけを、後段で補助候補として扱う。
+        # 主検索にも出た商品は主候補として扱い、広い検索による二重の減点を避ける。
+        row["_supplemental_broad"] = (
+            "broad" in lanes
+            and not ({"relevance", "reviews", "fallback"} & lanes)
+        )
     return list(merged.values())
 
 
@@ -791,38 +804,63 @@ def amazon_direct_candidates(c, token, primary_query, fallback_queries=None,
 
 
 def select_rerank_candidates(items, limit=AI_RERANK_MAX, max_per_brand=3):
-    """AIに渡す候補を、関連性順と評価順から交互に選ぶ。
+    """AIに渡す候補を、主検索を優先して選ぶ。
 
-    Gemini呼び出し数は1回のまま、入力トークンとSEOブランド独占を抑える。
+    主検索（関連性・評価・具体クエリ）だけで十分な候補がある場合は、
+    広いカテゴリ検索をAIへ渡さない。主検索が薄い時だけ広い検索を補助として
+    追加するため、候補の質とGemini無料枠の両方を守る。
     """
-    lanes = []
-    for lane in ("relevance", "reviews", "broad", "fallback"):
+    def lane_rows(lane):
         key = "%s_rank" % lane
-        lane_rows = sorted(
+        return sorted(
             [r for r in items or [] if r.get("candidate", {}).get(key) is not None],
             key=lambda r: r["candidate"][key])
-        lanes.append(lane_rows)
+
+    def pick_from_lanes(lanes, picked, seen, brands):
+        """各レーンをラウンドロビンで取り、ブランド上限を守る。"""
+        rows_by_lane = [lane_rows(lane) for lane in lanes]
+        while len(picked) < limit:
+            progressed = False
+            for rows in rows_by_lane:
+                while rows:
+                    row = rows.pop(0)
+                    asin = row.get("amazon", {}).get("asin")
+                    if not asin or asin in seen:
+                        continue
+                    brand = _norm_brand(row.get("amazon", {}).get("brand"))
+                    if brand and brands.get(brand, 0) >= max_per_brand:
+                        continue
+                    picked.append(row)
+                    seen.add(asin)
+                    if brand:
+                        brands[brand] = brands.get(brand, 0) + 1
+                    progressed = True
+                    break
+                if len(picked) >= limit:
+                    break
+            if not progressed:
+                break
+
     picked, seen, brands = [], set(), {}
-    while len(picked) < limit:
-        progressed = False
-        for rows in lanes:
-            while rows:
-                row = rows.pop(0)
-                asin = row.get("amazon", {}).get("asin")
-                if not asin or asin in seen:
-                    continue
-                brand = _norm_brand(row.get("amazon", {}).get("brand"))
-                if brand and brands.get(brand, 0) >= max_per_brand:
-                    continue
-                picked.append(row); seen.add(asin)
-                if brand:
-                    brands[brand] = brands.get(brand, 0) + 1
-                progressed = True
-                break
-            if len(picked) >= limit:
-                break
-        if not progressed:
-            break
+    pick_from_lanes(("relevance", "reviews", "fallback"), picked, seen, brands)
+
+    # 主検索で5件以上取れたら、広いカテゴリ検索は候補に混ぜない。
+    # 5件未満の場合だけ補助候補を後ろに追加し、最終AIゲートで90点未満を落とす。
+    if len(picked) < BROAD_FALLBACK_TRIGGER_COUNT and len(picked) < limit:
+        broad_rows = lane_rows("broad")
+        while broad_rows and len(picked) < limit:
+            row = broad_rows.pop(0)
+            asin = row.get("amazon", {}).get("asin")
+            if not asin or asin in seen:
+                continue
+            brand = _norm_brand(row.get("amazon", {}).get("brand"))
+            if brand and brands.get(brand, 0) >= max_per_brand:
+                continue
+            row["_supplemental_broad"] = True
+            picked.append(row)
+            seen.add(asin)
+            if brand:
+                brands[brand] = brands.get(brand, 0) + 1
     return picked
 
 
@@ -1592,9 +1630,21 @@ def select_final_pool(items, require_ai=True, rel_min=REL_MIN,
     if require_ai:
         apply_axis_evidence(pool, components)
         pool = apply_intent_category_evidence(pool, theme=theme, angle_title=angle_title)
-        pool = [r for r in pool
-                if r.get("ai_score") is not None and r.get("ai_score") >= rel_min]
-    _rerank_sort(pool)
+        primary = [r for r in pool if not r.get("_supplemental_broad")]
+        supplemental = [r for r in pool if r.get("_supplemental_broad")]
+        primary = [r for r in primary
+                   if r.get("ai_score") is not None and r.get("ai_score") >= rel_min]
+        supplemental = [r for r in supplemental
+                         if r.get("ai_score") is not None
+                         and r.get("ai_score") >= max(rel_min, BROAD_MIN_AI_SCORE)]
+        _rerank_sort(primary)
+        _rerank_sort(supplemental)
+        # 補助検索だけの商品種は1件まで。主検索の多様性ルールとは別に管理する。
+        supplemental = diversify_product_types(
+            supplemental, max_per=BROAD_MAX_PER_PRODUCT_TYPE)
+        pool = primary + supplemental
+    else:
+        _rerank_sort(pool)
     pool = gender_consistency(pool)
     pool = diversify_brands(pool, max_per=max_per_brand)
     pool = diversify_product_types(pool)
@@ -1788,6 +1838,8 @@ def main():
         "search_candidates": len(resolved),
         "search_dropped": len(dropped),
         "lane_or_brand_limited": 0,
+        "supplemental_broad_ai": 0,
+        "supplemental_broad_final": 0,
         "duplicate_removed": 0,
         "variant_removed": 0,
         "ai_low_score": 0,
@@ -1825,8 +1877,12 @@ def main():
     if _before_var != len(uniq):
         print("    同ブランドの重複/色サイズ違いを %d件 畳み込み" % (_before_var - len(uniq)))
     multi = sum(1 for r in uniq if r["consensus"] >= 2)
+    diagnostics["supplemental_broad_ai"] = sum(
+        1 for r in uniq if r.get("_supplemental_broad"))
     print("\n[2] AI投入候補: %d件 → %d件（関連性順+評価順の両方に出現=%d件）"
           % (len(resolved), len(uniq), multi))
+    print("    広いカテゴリ検索だけの補助候補をAIへ投入: %d件（主検索5件未満の時だけ）"
+          % diagnostics["supplemental_broad_ai"])
     if LEARN:
         _bw = LEARN.get("brand_weight") or {}
         _fs = LEARN.get("few_shot") or []
@@ -1872,6 +1928,8 @@ def main():
         print("    関連性フィルタ：スコア<%d または未採点 %d件を不可逆に除外"
               % (REL_MIN, rejected))
     diagnostics["final_candidates"] = len(pool)
+    diagnostics["supplemental_broad_final"] = sum(
+        1 for r in pool if r.get("_supplemental_broad"))
     if not pool:
         diagnostics["empty_reason"] = "ai_filtered" if want_rerank else "unknown_empty"
         emit_candidate_diagnostic(diagnostics)

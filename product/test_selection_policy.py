@@ -29,6 +29,13 @@ def make_row(score, brand, verdict="採用", title=None, n=0):
     }
 
 
+def make_amazon_lane_row(lane, rank, brand, n, title="枕"):
+    row = make_row(95, brand, title=title, n=n)
+    row["candidate"]["%s_rank" % lane] = rank
+    row["candidate"]["amazon_lanes"] = [lane]
+    return row
+
+
 class SelectionPolicyTest(unittest.TestCase):
     def setUp(self):
         bc.LEARN = None
@@ -127,6 +134,40 @@ class SelectionPolicyTest(unittest.TestCase):
         reviews["candidate"]["reviews_rank"] = 5
         out = bc.select_final_pool([relevance, reviews])
         self.assertEqual([reviews, relevance], out)
+
+    def test_broad_lane_is_not_sent_to_ai_when_primary_has_five(self):
+        rows = [make_amazon_lane_row("relevance", i + 1, "主%d" % i, i)
+                for i in range(5)]
+        rows += [make_amazon_lane_row("broad", i + 1, "補助%d" % i, 20 + i)
+                 for i in range(3)]
+        out = bc.select_rerank_candidates(rows, limit=8)
+        self.assertEqual(5, len(out))
+        self.assertTrue(all(not row.get("_supplemental_broad") for row in out))
+        self.assertEqual({"主%d" % i for i in range(5)},
+                         {row["amazon"]["brand"] for row in out})
+
+    def test_broad_lane_is_added_only_when_primary_is_thin(self):
+        rows = [make_amazon_lane_row("relevance", i + 1, "主%d" % i, i)
+                for i in range(4)]
+        rows += [make_amazon_lane_row("broad", i + 1, "補助%d" % i, 20 + i)
+                 for i in range(2)]
+        out = bc.select_rerank_candidates(rows, limit=8)
+        self.assertEqual(6, len(out))
+        self.assertEqual(2, sum(1 for row in out if row.get("_supplemental_broad")))
+
+    def test_broad_only_candidates_need_ninety_and_one_per_type(self):
+        primary = make_row(80, "主", title="枕 高さ調整", n=1)
+        broad_good = make_row(95, "補助A", title="枕 高さ調整", n=2)
+        broad_good["_supplemental_broad"] = True
+        broad_same_type = make_row(94, "補助B", title="枕 低反発", n=3)
+        broad_same_type["_supplemental_broad"] = True
+        broad_low = make_row(85, "補助C", title="枕 横向き", n=4)
+        broad_low["_supplemental_broad"] = True
+        for row in (primary, broad_good, broad_same_type, broad_low):
+            row["product_type"] = "枕"
+        out = bc.select_final_pool([primary, broad_good, broad_same_type, broad_low])
+        self.assertEqual([80, 95], [row["ai_score"] for row in out])
+        self.assertEqual(1, sum(1 for row in out if row.get("_supplemental_broad")))
 
     def test_product_type_diversity_is_used_before_overflow(self):
         rows = [make_row(95 - i, "B%d" % i, n=i) for i in range(5)]
