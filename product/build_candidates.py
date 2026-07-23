@@ -53,6 +53,9 @@ AMAZON_LANE_COUNT = 8
 AMAZON_DIRECT_MIN = 10
 AI_RERANK_MAX = 18
 MAX_PER_PRODUCT_TYPE = 2
+# 広いカテゴリ語は、切り口検索で取りこぼした商品を補うための補助レーン。
+# 評価順検索は行わず、1切り口あたりの追加Amazon呼び出しを1回に抑える。
+AMAZON_BROAD_LANE_COUNT = 6
 
 # ---- レート配慮（無料枠を超えないための最小限のウェイト）----
 SLEEP_BETWEEN_AMAZON = 0.6   # Amazon searchItems 連打の間隔（秒）
@@ -594,6 +597,27 @@ def build_amazon_query(intent, search_kw):
     return " ".join(parts[:6]).strip()
 
 
+def build_broad_amazon_query(intent, search_kw):
+    """切り口検索を補う、広いカテゴリ用の短い検索語を1本作る。
+
+    切り口の悩み・買い軸は入れず、テーマの中心語だけを使う。
+    例: 「枕／買い替え向けの枕（高さで選ぶ）」→「枕」
+    「夏休みの自由研究」→「自由研究」
+    広い検索語だけで表示せず、後段のAI採点で切り口適合を確認する。
+    """
+    spec = intent or {}
+    theme = str(spec.get("theme") or "").strip()
+    if theme:
+        variants = theme_variants(theme)
+        # 複合テーマ・「AのB」は、theme_variantsの2番目が商品カテゴリの中心語。
+        if len(variants) > 1 and (re.search(r"[・/／]", theme) or "の" in theme):
+            return variants[1]
+        return variants[0]
+    # 任意テストなどでテーマが空でも、検索語の先頭カテゴリを使えるようにする。
+    tokens = [t for t in str(search_kw or "").split() if t]
+    return tokens[0] if tokens else ""
+
+
 def concrete_fallback_queries(intent, search_kw):
     """不足時にだけ使う、無料の決め打ち商品カテゴリ検索。
 
@@ -723,23 +747,39 @@ def merge_amazon_rows(groups):
     return list(merged.values())
 
 
-def amazon_direct_candidates(c, token, primary_query, fallback_queries=None):
-    """90点版の候補収集。通常はAmazon 2呼び出し、薄い時だけ1回追加する。"""
+def amazon_direct_candidates(c, token, primary_query, fallback_queries=None,
+                             broad_query=None):
+    """切り口検索を主、広いカテゴリ検索を補助にして候補を集める。
+
+    通常は切り口の関連性順＋評価順の2回に加え、カテゴリ補助を1回だけ行う。
+    広いレーンは候補を増やすだけで、最終表示は必ず同じAI適合ゲートを通る。
+    """
     groups, tried, dropped = [], [], []
     for lane in ("relevance", "reviews"):
         rows, lane_dropped, err = _amazon_lane(c, token, primary_query, lane=lane)
         groups.append(rows); dropped += lane_dropped
         tried.append({"query": primary_query, "lane": lane, "count": len(rows), "error": err})
         time.sleep(SLEEP_BETWEEN_AMAZON)
+
+    # --- 補助レーン：テーマだけの広い検索（評価順は追加しない） ---
+    # 切り口語と同一なら重複呼び出しを避ける。広い検索結果もAI入力候補に混ぜるが、
+    # 低スコア商品を件数合わせで復活させないため、ここでは表示候補を決めない。
+    if broad_query and _norm_key(broad_query) != _norm_key(primary_query):
+        rows, lane_dropped, err = _amazon_lane(
+            c, token, broad_query, lane="broad", count=AMAZON_BROAD_LANE_COUNT)
+        groups.append(rows); dropped += lane_dropped
+        tried.append({"query": broad_query, "lane": "broad",
+                      "count": len(rows), "error": err})
+        time.sleep(SLEEP_BETWEEN_AMAZON)
     merged = merge_amazon_rows(groups)
 
     # 0件や業務用ロットだらけの時だけ、AI展開の具体商品クエリで救済。
     need_fallback = len(merged) < AMAZON_DIRECT_MIN or len(dropped) >= 4
     if need_fallback:
-        base = _norm_key(primary_query)
+        base = {_norm_key(primary_query), _norm_key(broad_query)}
         for query in fallback_queries or []:
             query = (query or "").strip()
-            if not query or _norm_key(query) == base:
+            if not query or _norm_key(query) in base:
                 continue
             rows, lane_dropped, err = _amazon_lane(c, token, query, lane="fallback")
             groups.append(rows); dropped += lane_dropped
@@ -756,7 +796,7 @@ def select_rerank_candidates(items, limit=AI_RERANK_MAX, max_per_brand=3):
     Gemini呼び出し数は1回のまま、入力トークンとSEOブランド独占を抑える。
     """
     lanes = []
-    for lane in ("relevance", "reviews", "fallback"):
+    for lane in ("relevance", "reviews", "broad", "fallback"):
         key = "%s_rank" % lane
         lane_rows = sorted(
             [r for r in items or [] if r.get("candidate", {}).get(key) is not None],
@@ -1735,13 +1775,15 @@ def main():
     c = amazon_conf()
     token = amazon_token(c)
     primary_query = build_amazon_query(intent, kw) or kw
+    broad_query = build_broad_amazon_query(intent, kw)
     fallback_queries = (
         list(ai_queries or [])
         + concrete_fallback_queries(intent, kw)
         + plan_queries(kw)
     )
     resolved, tried, dropped = amazon_direct_candidates(
-        c, token, primary_query, fallback_queries=fallback_queries)
+        c, token, primary_query, fallback_queries=fallback_queries,
+        broad_query=broad_query)
     diagnostics = {
         "search_candidates": len(resolved),
         "search_dropped": len(dropped),
@@ -1752,7 +1794,8 @@ def main():
         "ai_unscored": 0,
         "final_candidates": 0,
     }
-    print("\n[1] Amazon直接候補: %d件（クエリ=%s）" % (len(resolved), primary_query))
+    print("\n[1] Amazon直接候補: %d件（切り口=%s / 補助カテゴリ=%s）"
+          % (len(resolved), primary_query, broad_query or "なし"))
     for log in tried:
         suffix = " / ERROR=" + log["error"] if log.get("error") else ""
         print("    %s: %s → %d件%s" % (log["lane"], log["query"], log["count"], suffix))

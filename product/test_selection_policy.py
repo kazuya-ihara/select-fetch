@@ -171,6 +171,31 @@ class SelectionPolicyTest(unittest.TestCase):
         merged = next(r for r in rows if r["amazon"]["asin"] == "A")
         self.assertEqual({"relevance", "reviews"}, set(merged["candidate"]["amazon_lanes"]))
 
+    def test_broad_lane_is_added_once_and_deduplicated(self):
+        item_a = {"asin": "A", "itemInfo": {"title": {"displayValue": "枕 高さ調整"}}}
+        item_b = {"asin": "B", "itemInfo": {"title": {"displayValue": "枕 低反発"}}}
+        item_c = {"asin": "C", "itemInfo": {"title": {"displayValue": "枕 横向き"}}}
+        conf = {"api_url": "https://example/searchItems", "partner_tag": "tag", "marketplace": "www.amazon.co.jp"}
+        with mock.patch.object(bc, "amazon_search", side_effect=[
+                {"searchResult": {"items": [item_a]}},
+                {"searchResult": {"items": [item_a]}},
+                {"searchResult": {"items": [item_b, item_c]}},
+            ]), mock.patch.object(bc.time, "sleep"):
+            rows, tried, _ = bc.amazon_direct_candidates(
+                conf, "token", "枕 高さ", broad_query="枕")
+        self.assertEqual(["relevance", "reviews", "broad"], [t["lane"] for t in tried])
+        self.assertEqual({"A", "B", "C"}, {r["amazon"]["asin"] for r in rows})
+        merged = next(r for r in rows if r["amazon"]["asin"] == "A")
+        self.assertEqual({"relevance", "reviews"}, set(merged["candidate"]["amazon_lanes"]))
+
+    def test_broad_query_uses_theme_category_without_intent_axis(self):
+        intent = bc.build_intent_spec(
+            "枕", "買い替え向けの枕（高さで選ぶ）", "枕 高さ", [["buy", "高さ"]])
+        self.assertEqual("枕", bc.build_broad_amazon_query(intent, "枕 高さ"))
+        intent = bc.build_intent_spec(
+            "夏休みの自由研究", "低学年に映えるキット", "自由研究 低学年", [])
+        self.assertEqual("自由研究", bc.build_broad_amazon_query(intent, "自由研究 低学年"))
+
     def test_cached_reason_keeps_type_out_of_visible_reason(self):
         packed = bc._encode_cached_reason("切り口に合致", "携帯ポンプ")
         self.assertEqual(("切り口に合致", "携帯ポンプ"), bc._decode_cached_reason(packed))
