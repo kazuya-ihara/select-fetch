@@ -354,6 +354,7 @@ class SaveQualityTest(unittest.TestCase):
             {"asin": "B", "ai_score": 90},
             {"asin": "C", "ai_score": 85},
             {"asin": "D", "ai_score": 80},
+            {"asin": "E", "ai_score": 80},
         ]
         with mock.patch.object(product_fetch, "rpc", return_value=4) as rpc, \
              mock.patch.object(product_fetch, "usage_bump") as bump:
@@ -380,15 +381,17 @@ class SaveQualityTest(unittest.TestCase):
                 {"asin": "C", "ai_score": 69}]
         self.assertFalse(product_fetch.validate_new_result(rows, rerank=True)[0])
 
-    def test_quality_promotion_allows_four_strong_items(self):
+    def test_quality_promotion_allows_five_strong_items(self):
         rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90},
-                {"asin": "C", "ai_score": 85}, {"asin": "D", "ai_score": 80}]
+                {"asin": "C", "ai_score": 85}, {"asin": "D", "ai_score": 80},
+                {"asin": "E", "ai_score": 80}]
         ok, reason = product_fetch.validate_quality_promotion(rows, 9, rerank=True)
         self.assertTrue(ok, reason)
 
     def test_quality_promotion_allows_new_high_quality_result(self):
         rows = [{"asin": "A", "ai_score": 95}, {"asin": "B", "ai_score": 90},
-                {"asin": "C", "ai_score": 85}, {"asin": "D", "ai_score": 80}]
+                {"asin": "C", "ai_score": 85}, {"asin": "D", "ai_score": 80},
+                {"asin": "E", "ai_score": 80}]
         ok, reason = product_fetch.validate_quality_promotion(rows, 0, rerank=True)
         self.assertTrue(ok, reason)
         self.assertIn("新規登録", reason)
@@ -398,11 +401,12 @@ class SaveQualityTest(unittest.TestCase):
                 {"asin": "C", "ai_score": 90}]
         ok, reason = product_fetch.validate_quality_promotion(rows, 9, rerank=True)
         self.assertFalse(ok)
-        self.assertIn("4件以上", reason)
+        self.assertIn("5件以上", reason)
 
     def test_quality_promotion_rejects_low_average(self):
         rows = [{"asin": "A", "ai_score": 90}, {"asin": "B", "ai_score": 85},
-                {"asin": "C", "ai_score": 80}, {"asin": "D", "ai_score": 80}]
+                {"asin": "C", "ai_score": 80}, {"asin": "D", "ai_score": 80},
+                {"asin": "E", "ai_score": 80}]
         ok, reason = product_fetch.validate_quality_promotion(rows, 9, rerank=True)
         self.assertFalse(ok)
         self.assertIn("平均AI85点未満", reason)
@@ -411,7 +415,8 @@ class SaveQualityTest(unittest.TestCase):
         pool = [{"asin": "A", "ai_score": 95, "title": "A"},
                 {"asin": "B", "ai_score": 90, "title": "B"},
                 {"asin": "C", "ai_score": 85, "title": "C"},
-                {"asin": "D", "ai_score": 80, "title": "D"}]
+                {"asin": "D", "ai_score": 80, "title": "D"},
+                {"asin": "E", "ai_score": 80, "title": "E"}]
         rows = [{"asin": x["asin"], "ai_score": x["ai_score"]} for x in pool]
         with mock.patch.object(product_fetch, "rpc", side_effect=[9, 4]) as rpc, \
              mock.patch.object(product_fetch, "build_pool", return_value=pool), \
