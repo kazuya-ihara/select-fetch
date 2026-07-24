@@ -65,8 +65,14 @@ def parse_custom_targets(text, limit=CUSTOM_TARGET_LIMIT):
     通常の FETCH_TARGET（テーマ|切り口）と区別するため、3項目の行が
     1つでもあればカスタム指定として扱う。空欄や重複は除外し、最大3件。
     """
-    lines = [line.strip() for line in (text or "").splitlines()
-             if line.strip() and not line.strip().startswith("#")]
+    # workflow_dispatch の1行入力でも複数件を指定できるよう、`;;` を
+    # 切り口の区切りとして受け付ける。改行入力も従来どおり利用できる。
+    lines = []
+    for raw_line in (text or "").splitlines():
+        for line in raw_line.split(";;"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                lines.append(line)
     if not any(line.count("|") >= 2 for line in lines):
         return None
     out, seen = [], set()

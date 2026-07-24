@@ -19,6 +19,10 @@ class CustomShadowTargetTests(unittest.TestCase):
     def test_normal_target_is_not_custom(self):
         self.assertIsNone(parse_custom_targets("枕|高さで選ぶ"))
 
+    def test_custom_targets_accept_single_line_separator(self):
+        rows = parse_custom_targets("A|a|a kw;;B|b|b kw;;C|c|c kw")
+        self.assertEqual([r["theme"] for r in rows], ["A", "B", "C"])
+
     def test_invalid_custom_target_is_rejected(self):
         with self.assertRaises(ValueError):
             parse_custom_targets("A|a|a kw\nB|b")
