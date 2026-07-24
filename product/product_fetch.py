@@ -577,7 +577,8 @@ def main():
         if args.queue and done_fetch >= args.limit:
             print("  上限 %d 件に達したので停止。" % args.limit); break
         r = fetch_and_save(token, args.date, theme, angle, kw, args.rerank, args.force,
-                           components=components, promote=args.promote_quality)
+                           components=components, shadow=args.shadow,
+                           promote=args.promote_quality)
         stats[r] = stats.get(r, 0) + 1
         if r == "limit":
             break

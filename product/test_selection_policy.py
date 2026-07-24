@@ -447,6 +447,23 @@ class SaveQualityTest(unittest.TestCase):
         self.assertEqual("empty", result)
         self.assertEqual(1, rpc.call_count)
 
+    def test_main_passes_shadow_flag_to_fetcher(self):
+        """CLIの--shadowが実際の取得処理へ渡ることを固定する。"""
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            json.dump([{"theme": "テーマ", "angle_title": "切り口", "kw": "検索語"}], handle)
+            queue_path = handle.name
+        try:
+            with mock.patch.object(product_fetch, "read_batch_token", return_value="token"), \
+                 mock.patch.object(product_fetch, "latest_catalog_date", return_value="2026-07-21"), \
+                 mock.patch.object(product_fetch, "fetch_and_save", return_value="shadow") as fetch, \
+                 mock.patch.object(product_fetch.time, "sleep"), \
+                 mock.patch.object(sys, "argv", ["product_fetch.py", "--queue", queue_path,
+                                                   "--limit", "1", "--shadow"]):
+                product_fetch.main()
+            self.assertTrue(fetch.call_args.kwargs["shadow"])
+        finally:
+            os.unlink(queue_path)
+
 
 if __name__ == "__main__":
     unittest.main()
