@@ -570,7 +570,8 @@ def main():
     else:
         print("‼ 使い方: --theme/--kw（1件）か --queue（先読み）。--help 参照"); sys.exit(1)
 
-    stats = {"saved": 0, "skip": 0, "empty": 0, "error": 0, "limit": 0}
+    stats = {"saved": 0, "promoted": 0, "shadow": 0,
+             "skip": 0, "empty": 0, "error": 0, "limit": 0}
     done_fetch = 0
     for theme, angle, kw, components in jobs:
         if args.queue and done_fetch >= args.limit:
@@ -580,13 +581,14 @@ def main():
         stats[r] = stats.get(r, 0) + 1
         if r == "limit":
             break
-        if r in ("saved", "promoted"):       # 実取得した時だけ間隔を空ける
+        if r in ("saved", "promoted", "shadow"):  # 影テストも実取得として数える
             done_fetch += 1
             time.sleep(SLEEP_BETWEEN_ANGLES)
 
     print("\n" + "=" * 60)
-    print("完了: 保存%d / スキップ%d / 空%d / エラー%d / 上限停止%d"
-          % (stats["saved"], stats["skip"], stats["empty"], stats["error"], stats["limit"]))
+    print("完了: 保存%d / 品質昇格%d / 影テスト%d / スキップ%d / 空%d / エラー%d / 上限停止%d"
+          % (stats["saved"], stats["promoted"], stats["shadow"], stats["skip"],
+             stats["empty"], stats["error"], stats["limit"]))
     print("本日の取得済み切り口数: %d / 上限%d" % (usage_load(), DAILY_ANGLE_LIMIT))
 
 
